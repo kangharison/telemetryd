@@ -86,6 +86,9 @@ PRP1/PRP2는 물리주소가 아니라 **IOVA**(디바이스가 보는 주소)�
 
 ## CLI (순수 라이브러리 import, gRPC 안 거침)
 
+> 📖 **[CLI 사용 가이드](docs/CLI_GUIDE.md)** — 웹 화면 ↔ CLI 커맨드 대응표,
+> 커맨드별 사용법, 자주 막히는 곳 정리. 웹에서 보던 내용은 전부 CLI로도 볼 수 있다.
+
 ```bash
 .venv/bin/telemetryd devices
 .venv/bin/telemetryd snapshot nvme0

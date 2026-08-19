@@ -120,3 +120,37 @@ def test_topology_tree_shows_both_layers():
 def test_topology_details_flag():
     out = _run("topology", "--details")
     assert "vendor:device" in out and "nsid" in out
+
+
+def test_target_remove_accepts_the_same_options_as_add(tmp_path, monkeypatch):
+    """add와 remove가 **같은 옵션 형태**를 받아야 한다.
+
+    예전엔 add는 `--name fio`인데 remove만 위치 인자(`name fio`)라서, add한
+    명령을 그대로 복사해 remove하면 "No such option"으로 막혔다. 실제로 가이드를
+    쓰다 걸린 비대칭이라 회귀로 고정한다."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    r = CliRunner()
+
+    assert r.invoke(cli, ["target", "add", "--name", "fio"]).exit_code == 0
+    out = r.invoke(cli, ["target", "remove", "--name", "fio"])
+    assert out.exit_code == 0, out.output
+    assert "제거: name=fio" in out.output
+
+
+def test_target_remove_still_accepts_positional_form(tmp_path, monkeypatch):
+    """예전 형태를 쓰던 스크립트를 깨지 않는다."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    r = CliRunner()
+
+    r.invoke(cli, ["target", "add", "--name", "fio"])
+    out = r.invoke(cli, ["target", "remove", "name", "fio"])
+    assert out.exit_code == 0, out.output
+    assert "제거: name=fio" in out.output
+
+
+def test_target_remove_rejects_mixed_and_empty_forms(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    r = CliRunner()
+
+    assert "하나만" in r.invoke(cli, ["target", "remove", "name", "fio", "--name", "fio"]).output
+    assert "지정할 것" in r.invoke(cli, ["target", "remove"]).output

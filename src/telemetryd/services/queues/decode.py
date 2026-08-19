@@ -21,7 +21,17 @@ def _window_indices(doorbell: int, depth: int, limit: int) -> List[int]:
     n = min(limit, depth) if limit else depth
     return [(doorbell - 1 - i) % depth for i in range(n)]
 
-_DISK_RE = re.compile(rb"^nvme(\d+)n1$")
+#: gendisk 이름 -> (컨트롤러 인스턴스, 네임스페이스 ID).
+#
+# **네임스페이스 번호를 1로 고정하면 안 된다**(예전엔 `nvme(\d+)n1$` 이었다).
+# QEMU 검증 환경은 항상 nsid=1이라 안 드러났지만, 실기 엔터프라이즈 SSD는
+# 네임스페이스 관리로 NSID가 1이 아닌 경우가 흔하다(예: nvme0n2만 존재). 그런
+# 컨트롤러는 목록에서 통째로 빠져 "장치가 안 보인다"가 된다.
+#
+# NVMe 멀티패스가 켜져 있으면 개별 경로가 `nvme0c1n1` 형태로도 나타나는데,
+# 그건 head 장치(`nvme0n1`)와 같은 것을 가리키는 숨은 경로라 여기서는 안 잡는다
+# (안 그러면 같은 컨트롤러가 중복으로 보인다).
+_DISK_RE = re.compile(rb"^nvme(\d+)n(\d+)$")
 
 
 

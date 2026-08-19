@@ -17,6 +17,29 @@ import click
 from telemetryd.backend import DeviceNotFoundError, QueueNotFoundError, get_backend
 
 
+#: --watch 스파크라인의 가로 폭(=유지할 이력 길이). 1초 틱이라 약 40초치.
+_SPARK_WIDTH = 40
+
+#: 낮음->높음 순의 블록 문자. 터미널 폰트 대부분이 지원한다.
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values) -> str:
+    """숫자 목록을 한 줄 막대 그래프로. 웹 성능 탭의 시계열 그래프에 대응한다.
+
+    스케일은 **이 창(window) 안의 최대값 기준**이다 — 절대량이 아니라 "늘고
+    있는지/줄고 있는지"를 보는 게 목적이라, 큐마다 규모가 달라도 추세가 보인다.
+    값이 하나뿐이거나 전부 0이면 최저 블록으로 채운다(0으로 나누기 방지)."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return ""
+    hi = max(vals)
+    if hi <= 0:
+        return _SPARK_CHARS[0] * len(vals)
+    last = len(_SPARK_CHARS) - 1
+    return "".join(_SPARK_CHARS[min(last, int(v / hi * last))] for v in vals)
+
+
 def _hexdump(data: bytes, base_addr: int) -> str:
     lines = []
     for off in range(0, len(data), 16):
@@ -274,6 +297,12 @@ def perf(backend, device, watch_):
     IOPS/대역폭/평균 레이턴시 — 요청사항: "device/개별 queue별로
     iops/bandwidth/latency"."""
 
+    # [한국어] --watch 일 때 qid별 IOPS 이력(스파크라인용). 웹 성능 탭의 시계열
+    # 그래프에 대응하는 것 — 숫자만 보면 "지금 값"은 알아도 "늘고 있는지 줄고
+    # 있는지"를 못 본다. 서버는 매 틱의 순간값만 주므로 이력은 클라이언트가
+    # 쌓는다(웹과 같은 구조).
+    history: dict = {}
+
     def once():
         try:
             p = backend.get_performance(device)
@@ -282,25 +311,35 @@ def perf(backend, device, watch_):
         if not p.available:
             click.secho(f"[안내] {p.error}", fg="yellow")
             return
+        spark_col = f" {'추이(IOPS)':<{_SPARK_WIDTH}}" if watch_ else ""
         header = (
             f"{'qid':>4} {'iops':>9} {'read/s':>9} {'write/s':>9} {'BW(MB/s)':>10} "
             f"{'avg(us)':>9} {'p50(us)':>9} {'p95(us)':>9} {'p99(us)':>9} {'p99.9(us)':>10}"
+            f"{spark_col}"
         )
         click.echo(header)
 
         def row(q, label=None):
             qid_str = label if label is not None else str(q.qid)
-            click.echo(
+            line = (
                 f"{qid_str:>4} {q.iops:>9.0f} {q.read_iops:>9.0f} {q.write_iops:>9.0f} "
                 f"{q.bandwidth_bytes_per_sec / 1e6:>10.2f} {q.avg_latency_us:>9.1f} "
                 f"{q.p50_latency_us:>9.1f} {q.p95_latency_us:>9.1f} {q.p99_latency_us:>9.1f} "
                 f"{q.p999_latency_us:>10.1f}"
             )
+            if watch_:
+                key = label if label is not None else q.qid
+                buf = history.setdefault(key, [])
+                buf.append(q.iops)
+                if len(buf) > _SPARK_WIDTH:
+                    del buf[:-_SPARK_WIDTH]
+                line += " " + _sparkline(buf)
+            click.echo(line)
 
         for q in p.queues:
             row(q)
         if p.aggregate is not None:
-            click.echo("-" * len(header))
+            click.echo("-" * 96)
             row(p.aggregate, label="ALL")
 
     if not watch_:
@@ -589,11 +628,40 @@ def target_add(backend, pid, name, name_pattern, cmdline_pattern, adapter):
 
 
 @target.command("remove")
-@click.argument("kind")
-@click.argument("value")
+@click.argument("kind", required=False)
+@click.argument("value", required=False)
+@click.option("--pid", type=int, default=None, help="PID 규칙 제거")
+@click.option("--name", default=None, help="이름 규칙 제거")
+@click.option("--name-pattern", default=None, help="이름 정규식 규칙 제거")
+@click.option("--cmdline-pattern", default=None, help="cmdline 정규식 규칙 제거")
 @click.pass_obj
-def target_remove(backend, kind, value):
-    """대상 규칙 제거. 이미 만들어진 세션 데이터는 지우지 않는다."""
+def target_remove(backend, kind, value, pid, name, name_pattern, cmdline_pattern):
+    """대상 규칙 제거. 이미 만들어진 세션 데이터는 지우지 않는다.
+
+    add와 **같은 옵션 형태**로 지울 수 있다(`--name fio`). 위치 인자
+    (`remove name fio`)도 계속 받는다 — 예전 형태를 쓰던 스크립트를 안 깨려고
+    남겨둔 것이고, 둘 중 하나만 쓰면 된다.
+
+    옵션 형태를 추가한 이유: add는 `--name fio`인데 remove만 `name fio`라
+    비대칭이어서, add한 그대로 복사해 remove하면 "No such option" 으로 막혔다.
+    """
+    chosen = [(k, v) for k, v in (
+        ("pid", str(pid) if pid is not None else None),
+        ("name", name),
+        ("name_pattern", name_pattern),
+        ("cmdline_pattern", cmdline_pattern),
+    ) if v is not None]
+
+    if chosen and (kind or value):
+        raise click.ClickException("위치 인자와 옵션을 섞어 쓸 수 없다 — 하나만 쓸 것")
+    if len(chosen) > 1:
+        raise click.ClickException("한 번에 규칙 하나만 제거할 수 있다")
+    if chosen:
+        kind, value = chosen[0]
+    elif not (kind and value):
+        raise click.ClickException(
+            "제거할 규칙을 지정할 것 — 예: `target remove --name fio` 또는 `target remove name fio`")
+
     rules = backend.remove_target(kind, value)
     click.secho(f"제거: {kind}={value}", fg="yellow")
     for r in rules:

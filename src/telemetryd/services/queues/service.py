@@ -10,6 +10,7 @@ request_queue_busy_iter를 이용한 hctx별 inflight, PRP 디코딩.
 from __future__ import annotations
 
 import os
+import re
 import struct
 from typing import Dict, List, Optional, Tuple
 
@@ -62,10 +63,34 @@ class DrgnQueueService:
                 return disk
         return None
 
+    def _instance_of(self, device: str) -> int:
+        m = re.match(r"^nvme(\d+)$", device)
+        if not m:
+            raise DeviceNotFoundError(device)
+        return int(m.group(1))
+
+    def _find_any_namespace_disk(self, instance: int):
+        """이 컨트롤러에 속한 네임스페이스 gendisk 아무거나(가장 작은 nsid).
+
+        `nvme{N}n1`을 콕 집어 찾으면 안 된다 — 실기 엔터프라이즈 SSD는
+        네임스페이스 관리로 NSID가 1이 아닐 수 있고(예: nvme0n2만 존재),
+        그러면 멀쩡한 컨트롤러를 못 찾는다. 컨트롤러 자체(struct nvme_dev)에
+        닿는 게 목적이라 어느 네임스페이스를 거치든 결과는 같다."""
+        from drgn.helpers.linux.block import disk_name, for_each_disk
+
+        best = None
+        for disk in for_each_disk(self._ensure_program()):
+            m = _DISK_RE.match(disk_name(disk))
+            if m and int(m.group(1)) == instance:
+                nsid = int(m.group(2))
+                if best is None or nsid < best[0]:
+                    best = (nsid, disk)
+        return best[1] if best else None
+
     def lookup_device(self, device: str):
         from drgn import cast, container_of
 
-        disk = self._find_disk(f"{device}n1".encode())
+        disk = self._find_any_namespace_disk(self._instance_of(device))
         if disk is None:
             raise DeviceNotFoundError(device)
         ns = cast("struct nvme_ns *", disk.private_data)
@@ -77,12 +102,15 @@ class DrgnQueueService:
         from drgn.helpers.linux.block import disk_name, for_each_disk
 
         prog = self._ensure_program()
-        names = []
+        # [한국어] 한 컨트롤러에 네임스페이스가 여러 개면 gendisk도 여러 개
+        # (nvme0n1, nvme0n2, ...) 나오므로 컨트롤러 단위로 **중복을 없앤다**.
+        # 목록이 반환하는 건 네임스페이스가 아니라 컨트롤러이기 때문.
+        instances = set()
         for disk in for_each_disk(prog):
             m = _DISK_RE.match(disk_name(disk))
             if m:
-                names.append(f"nvme{int(m.group(1))}")
-        return sorted(names, key=lambda s: int(s[4:]))
+                instances.add(int(m.group(1)))
+        return [f"nvme{i}" for i in sorted(instances)]
 
     # ---- 요청사항 1: 큐 스냅샷 (sq_tail/cq_head/inflight) ------------------
 
