@@ -54,6 +54,8 @@ from telemetryd.models import (
 from telemetryd.nvme_const import ADM_OPC, MAX_PAGE_DUMP, NVM_OPC, PAGE_SIZE, opcode_name
 from telemetryd.services.events import MockEventService
 from telemetryd.services.perf import MockPerfService
+from telemetryd.services.profiler import MockProfilerService
+from telemetryd.services.topology import MockTopologyService
 
 MAX_DEPTH = 10          # treewalk.py의 실제 규칙과 동일 (§DESIGN 5.5) — 여기선 drgn 비의존을 위해 상수 중복
 MAX_ARRAY_CHILDREN = 64
@@ -122,13 +124,11 @@ class MockBackend:
     kind = "mock"
 
     def __init__(self, target_state=None):
-        # [한국어] 프로파일러 대상 규칙/세션 저장소. 테스트가 임시 경로를 줄 수
-        # 있게 주입 가능하게 둔다(기본은 실제 데몬과 같은 XDG state 경로).
-        self._target_state = target_state
-        self._targets = None
         # [한국어] 도메인별 서비스(services/*)의 mock 구현. 이 백엔드는 그 앞의
         # 파사드다 — DrgnBackend와 같은 구조를 유지해야 둘을 바꿔 끼울 수 있다.
         self._events = MockEventService()
+        self._profiler = MockProfilerService(target_state)
+        self._topology_svc = MockTopologyService(_TOPOLOGY, _addr_for)
         self._perf = MockPerfService(
             queues_of=lambda device: self._topology(device)["online_queues"]
         )
@@ -346,207 +346,30 @@ class MockBackend:
         return self._events.get_error_stats(device)
 
     def get_topology(self) -> Topology:
-        """합성 PCIe+NVMe 통합 트리.
-
-        실제 커널을 안 보므로 값은 전부 가짜지만, **구조는 drgn 백엔드가 만드는
-        것과 동일하게** 만든다(호스트 브리지 → 브리지 체인 → 엔드포인트 →
-        컨트롤러 → 서브시스템/네임스페이스/큐). 그래야 UI/CLI 렌더링과 조상
-        노드 공유 로직을 root 없이도 그대로 검증할 수 있다."""
-        root = TopologyNode(
-            id="system", kind=TOPO_SYSTEM, label="시스템 (mock)",
-            sublabel="PCI 호스트 브리지 → PCIe 계보 → NVMe 컨트롤러/서브시스템/네임스페이스/큐",
-        )
-        host = TopologyNode(
-            id="hostbridge:0000:00", kind=TOPO_HOST_BRIDGE, label="pci0000:00",
-            sublabel="PCI 호스트 브리지 (루트 버스)",
-            details=[TopologyDetail(key="도메인:버스", value="0000:00"),
-                     TopologyDetail(key="버스 번호 범위", value="0–255")],
-        )
-        root.children.append(host)
-        index = {host.id: host}
-
-        for device, topo in _TOPOLOGY.items():
-            pcie = topo["pcie"]
-            parent = host
-            # [한국어] 조상 브리지들은 id로 병합 — nvme0/nvme1이 같은 루트 포트를
-            # 공유하면 그 노드는 한 번만 나오고 거기서 갈라진다(실제 트리와 동일).
-            for bdf, kind_text, ids in pcie["parents"]:
-                node = index.get(f"pci:{bdf}")
-                if node is None:
-                    node = TopologyNode(
-                        id=f"pci:{bdf}", kind=TOPO_PCI_BRIDGE, label=bdf, sublabel=kind_text,
-                        details=[TopologyDetail(key="vendor:device", value=ids),
-                                 TopologyDetail(key="class", value="PCI-to-PCI 브리지 (0x060400)"),
-                                 TopologyDetail(key="PCIe 타입", value=kind_text)],
-                    )
-                    index[node.id] = node
-                    parent.children.append(node)
-                parent = node
-
-            endpoint = TopologyNode(
-                id=f"pci:{pcie['bdf']}", kind=TOPO_PCI_ENDPOINT, label=pcie["bdf"],
-                sublabel="NVM Express 컨트롤러 (0x010802)", device=device,
-                details=[TopologyDetail(key="vendor:device", value=pcie["ids"]),
-                         TopologyDetail(key="class", value="NVM Express 컨트롤러 (0x010802)"),
-                         TopologyDetail(key="PCIe 타입", value="PCIe 엔드포인트"),
-                         TopologyDetail(key="인터럽트 모드", value="MSI-X"),
-                         TopologyDetail(key="struct pci_dev", value=hex(_addr_for(device, "pci_dev")))],
-            )
-            parent.children.append(endpoint)
-
-            online, depth = topo["online_queues"], topo["depth"]
-            queues = TopologyNode(
-                id=f"queues:{device}", kind=TOPO_QUEUE_GROUP, label=f"큐 {online}개",
-                sublabel=f"admin 1 + I/O {online - 1} (할당 {online})", device=device,
-                details=[TopologyDetail(key="online_queues", value=str(online))],
-                children=[
-                    TopologyNode(
-                        id=f"q:{device}:{qid}", kind=TOPO_QUEUE,
-                        label=f"qid {qid}" + (" (admin)" if qid == 0 else ""),
-                        sublabel=f"depth {depth}", device=device,
-                        details=[TopologyDetail(key="qid", value=str(qid)),
-                                 TopologyDetail(key="depth", value=str(depth)),
-                                 TopologyDetail(key="blk-mq hctx",
-                                                value="없음 (admin)" if qid == 0 else f"hctx[{qid - 1}]")],
-                    )
-                    for qid in range(online)
-                ],
-            )
-            cap = topo["sectors"] * 512
-            ns = TopologyNode(
-                id=f"ns:{device}n1", kind=TOPO_NAMESPACE, label=f"{device}n1",
-                sublabel=f"네임스페이스 nsid={topo['nsid']}", device=device,
-                details=[TopologyDetail(key="nsid", value=str(topo["nsid"])),
-                         TopologyDetail(key="LBA 크기", value=f"{topo['lba']} B"),
-                         TopologyDetail(key="용량",
-                                        value=f"{cap / (1 << 30):.2f} GiB ({topo['sectors']} × 512B 섹터)")],
-            )
-            subsys = TopologyNode(
-                id=f"subsys:{topo['subsys']}", kind=TOPO_NVME_SUBSYS,
-                label=f"nvme-subsys{topo['subsys']}", sublabel="NVMe 서브시스템", device=device,
-                details=[TopologyDetail(key="subnqn", value=f"nqn.2019-08.org.qemu:mock{topo['subsys']}"),
-                         TopologyDetail(key="모델", value=topo["model"]),
-                         TopologyDetail(key="시리얼", value=f"MOCK{topo['subsys']:04d}"),
-                         TopologyDetail(key="펌웨어", value="1.0"),
-                         TopologyDetail(key="소속 컨트롤러", value="1개")],
-            )
-            endpoint.children.append(TopologyNode(
-                id=f"ctrl:{device}", kind=TOPO_NVME_CTRL, label=device,
-                sublabel="NVMe 컨트롤러 (struct nvme_dev / nvme_ctrl)", device=device,
-                details=[TopologyDetail(key="상태", value="NVME_CTRL_LIVE"),
-                         TopologyDetail(key="queue_count", value=str(online)),
-                         TopologyDetail(key="네임스페이스", value="1개"),
-                         TopologyDetail(key="struct nvme_dev", value=hex(_addr_for(device, "nvme_dev")))],
-                children=[subsys, ns, queues],
-            ))
-        return Topology(root=root, backend_kind="mock")
+        """토폴로지 서비스(mock)로 위임 — 로직은 services/topology/mock.py."""
+        return self._topology_svc.get_topology()
 
     # ---- NVMe I/O 프로세스 프로파일러 (합성 데이터) -----------------------
 
-    def _registry(self):
-        from telemetryd.backend.targets import TargetRegistry
-
-        if self._targets is None:
-            self._targets = TargetRegistry(self._target_state)
-        return self._targets
-
-    def _mock_processes(self) -> List[ProcessInfo]:
-        """대상 선택 화면을 root/게스트 없이 눌러볼 수 있게 만든 합성 프로세스들.
-
-        의도적으로 서로 다른 성격을 섞는다: 어댑터가 붙는 fio 2개(옵션이 다름),
-        어댑터가 없는 일반 프로세스, 그리고 선택 불가여야 하는 커널 스레드."""
-        return [
-            ProcessInfo(pid=4821, comm="ioworker", cmdline="./ioworker --threads 4",
-                        exe_path="/home/user/bin/ioworker", uid=1000, start_time_ns=111_000,
-                        thread_count=4,
-                        threads=[(4821, "ioworker"), (4822, "worker_00"),
-                                 (4823, "worker_01"), (4824, "worker_02")]),
-            ProcessInfo(pid=5102, comm="fio", uid=1000, start_time_ns=222_000,
-                        exe_path="/usr/bin/fio", thread_count=1, threads=[(5102, "fio")],
-                        cmdline="fio --name=randwrite --rw=randwrite --bs=4k --iodepth=32 "
-                                "--numjobs=4 --ioengine=io_uring --direct=1 "
-                                "--filename=/dev/nvme1n1"),
-            ProcessInfo(pid=3390, comm="fio", uid=1000, start_time_ns=333_000,
-                        exe_path="/usr/bin/fio", thread_count=1, threads=[(3390, "fio")],
-                        cmdline="fio --name=seqread --rw=read --bs=128k --iodepth=8 "
-                                "--ioengine=libaio --direct=1 --filename=/dev/nvme0n1"),
-            ProcessInfo(pid=9, comm="kworker/0:1", thread_count=1, threads=[(9, "kworker/0:1")],
-                        error="커널 스레드(mm 없음) — cmdline/exe 없음"),
-        ]
-
-    def _mock_proc_stats(self) -> List[ProcessIoStat]:
-        """합성 I/O 통계. seqread(3390)은 기대 128k인데 실측 4k로 두어, 어댑터의
-        기대값 대조가 **불일치를 실제로 잡아내는 것**을 mock에서도 보여준다
-        (명세 3-2의 핵심 가치 — bio 분할/max_sectors_kb 제한 상황)."""
-        return [
-            ProcessIoStat(device="nvme0", pid=4821, comm="ioworker", iops=2840.0,
-                          read_iops=1200.0, write_iops=1640.0, bandwidth_bps=46_530_560.0,
-                          avg_latency_us=118.0, io_size_dominant=16384,
-                          io_size_hist=[(16384, 2840)], queues=[(1, 1400), (2, 1440)],
-                          queue_depth_est=0.34, seq_ratio=0.9,
-                          threads=[ThreadIoStat(tid=4822, comm="worker_00", iops=1420.0),
-                                   ThreadIoStat(tid=4823, comm="worker_01", iops=1420.0)]),
-            ProcessIoStat(device="nvme1", pid=5102, comm="fio", iops=1120.0,
-                          read_iops=0.0, write_iops=1120.0, bandwidth_bps=4_587_520.0,
-                          avg_latency_us=28_500.0, io_size_dominant=4096,
-                          io_size_hist=[(4096, 1120)], queues=[(3, 1120)],
-                          queue_depth_est=31.9, seq_ratio=0.02,
-                          threads=[ThreadIoStat(tid=5102, comm="fio", iops=1120.0)]),
-            ProcessIoStat(device="nvme0", pid=3390, comm="fio", iops=640.0,
-                          read_iops=640.0, write_iops=0.0, bandwidth_bps=2_621_440.0,
-                          avg_latency_us=12_500.0, io_size_dominant=4096,
-                          io_size_hist=[(4096, 640)], queues=[(4, 640)],
-                          queue_depth_est=8.0, seq_ratio=0.95,
-                          threads=[ThreadIoStat(tid=3390, comm="fio", iops=640.0)]),
-            ProcessIoStat(device="nvme0", pid=9, comm="kworker/0:1", iops=12.0,
-                          read_iops=0.0, write_iops=12.0, bandwidth_bps=49_152.0,
-                          avg_latency_us=800.0, io_size_dominant=4096,
-                          io_size_hist=[(4096, 12)], queues=[(1, 12)],
-                          queue_depth_est=0.01, seq_ratio=0.5, threads=[]),
-        ]
-
     def list_processes(self, only_io: bool = False) -> List[ProcessListEntry]:
-        from telemetryd.backend.targets import rule_matches
-
-        io_by_pid = {}
-        for st in self._mock_proc_stats():
-            e = io_by_pid.setdefault(st.pid, {"rate": 0.0, "devices": set()})
-            e["rate"] += st.iops
-            e["devices"].add(st.device)
-        rules = self._registry().rules
-        out = []
-        for proc in self._mock_processes():
-            io = io_by_pid.get(proc.pid)
-            matched = next((r for r in rules if rule_matches(r, proc)), None)
-            entry = ProcessListEntry(
-                info=proc, io_active=bool(io and io["rate"] > 0),
-                io_rate=io["rate"] if io else 0.0,
-                target_devices=sorted(io["devices"]) if io else [],
-                is_target=matched is not None,
-                matched_rule=f"{matched.kind}={matched.value}" if matched else None,
-            )
-            if proc.error and "커널 스레드" in proc.error:
-                entry.selectable = False
-                entry.unselectable_reason = "커널 스레드 — 프로파일 대상이 아님"
-            out.append(entry)
-        if only_io:
-            out = [e for e in out if e.io_active]
-        out.sort(key=lambda e: (-e.io_rate, e.info.pid))
-        return out
+        """프로파일러 서비스(mock)로 위임."""
+        return self._profiler.list_processes(only_io)
 
     def list_targets(self) -> List[TargetRule]:
-        return list(self._registry().rules)
+        """프로파일러 서비스(mock)로 위임."""
+        return self._profiler.list_targets()
 
     def add_target(self, rule: TargetRule) -> List[TargetRule]:
-        self._registry().add_rule(rule)
-        return list(self._registry().rules)
+        """프로파일러 서비스(mock)로 위임."""
+        return self._profiler.add_target(rule)
 
     def remove_target(self, kind: str, value: str) -> List[TargetRule]:
-        self._registry().remove_rule(kind, value)
-        return list(self._registry().rules)
+        """프로파일러 서비스(mock)로 위임."""
+        return self._profiler.remove_target(kind, value)
 
     def get_profile(self) -> ProfileSnapshot:
-        return self._registry().refresh(self._mock_processes(), self._mock_proc_stats())
+        """프로파일러 서비스(mock)로 위임."""
+        return self._profiler.get_profile()
 
     def list_event_kinds(self) -> List[EventKindInfo]:
         """이벤트 서비스(mock)로 위임."""

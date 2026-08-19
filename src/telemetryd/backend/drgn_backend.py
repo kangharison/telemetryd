@@ -25,6 +25,8 @@ from telemetryd.platform.ebpf import as_log_source
 from telemetryd.platform.kernel import DrgnKernelSession
 from telemetryd.services.events import EbpfEventService
 from telemetryd.services.perf import EbpfPerfService
+from telemetryd.services.profiler import NvmeProfilerService
+from telemetryd.services.topology import DrgnTopologyService
 from telemetryd import treewalk
 
 
@@ -175,10 +177,12 @@ class DrgnBackend:
         # 그 서비스들 앞의 파사드 역할을 하며, 옮겨간 메서드는 위임만 한다.
         self._perf = EbpfPerfService(self._ebpf)
         self._events = EbpfEventService(self._ebpf)
-        # [한국어] 프로파일러 대상 규칙/세션 저장소. 데몬과 CLI가 같은 파일을
-        # 공유하도록 경로를 주입받을 수 있게 한다(기본은 XDG state 경로).
-        self._targets = None
-        self._target_state = target_state
+        self._profiler = NvmeProfilerService(
+            kernel=self._kernel, log_source=self._ebpf, target_state=target_state)
+        self._topology_svc = DrgnTopologyService(
+            list_devices=self.list_devices,
+            lookup_device=self._get_dev_and_disk,
+        )
 
     def _ensure_program(self):
         """drgn.Program — 접속 방식 판단/생성은 플랫폼 세션이 한다."""
@@ -494,150 +498,30 @@ class DrgnBackend:
         return self._events.get_error_stats(device)
 
     def get_topology(self):
-        """통합 토폴로지 트리 — backend/topology.py에 위임한다.
-
-        list_devices()로 찾은 모든 컨트롤러를 한 트리에 넣으므로, 같은 브리지
-        아래 붙은 장치들은 조상 노드를 공유한다. drgn 조회가 디바이스당 한
-        번씩 일어나 시간이 걸린다(QMP 백엔드 기준 수 초) — 그래서 gRPC 서버는
-        이 호출을 executor로 돌린다(server.py)."""
-        from telemetryd.backend.topology import build_topology
-
-        return build_topology(self.list_devices(), self._get_dev_and_disk, backend_kind="drgn")
+        """토폴로지 서비스로 위임(Facade) — 로직은 services/topology 에 있다."""
+        return self._topology_svc.get_topology()
 
     # ---- NVMe I/O 프로세스 프로파일러 ------------------------------------
 
-    def _registry(self):
-        """대상 규칙/세션 저장소(지연 생성) — 파일 I/O라 drgn과 무관."""
-        from telemetryd.backend.targets import TargetRegistry
-
-        if self._targets is None:
-            self._targets = TargetRegistry(self._target_state)
-        return self._targets
-
-    def _process_stats(self):
-        """eBPF 탐색 모드 결과(프로세스별 I/O). 수집기가 없으면 빈 목록."""
-        from telemetryd.backend.proc_stats import read_process_stats
-
-        if not self._ebpf_log_path:
-            return []
-        return read_process_stats(self._ebpf_log_path)
-
-    def _proc_infos(self):
-        """procinfo.list_processes()(비싼 drgn 조회)의 캐시된 래퍼.
-
-        **이 프로젝트에서 가장 비싼 단일 호출이다** — 프로세스마다 `mm->pgd`부터
-        페이지테이블을 직접 걸어 유저 메모리에서 cmdline을 읽어오느라 실측
-        60~90초가 걸린다(§9.15). 그런데 모든 backend 호출은 단일 워커
-        executor로 직렬화되므로(§9.8), 이게 도는 동안 `/api/devices` 같은
-        값싼 호출까지 전부 그 뒤에 줄을 선다.
-
-        캐시를 여기(가장 아래 공통 지점)에 두는 이유: 이 조회를 부르는 곳이
-        `list_processes()`(REST /api/processes)와 `get_profile()`(WS
-        /ws/profile, **2초 간격 스트림**) 두 군데인데, 처음엔
-        `list_processes()`에만 캐시를 달았다가 get_profile 쪽이 캐시를 통째로
-        우회해 2초마다 이 조회를 계속 태우는 걸 실측으로 발견했다. 공통
-        지점에 두면 호출자가 늘어도 자동으로 보호된다.
-
-        TTL은 고정값이면 안 된다 — 처음 30초로 뒀더니 조회 자체가 60~90초라
-        만료되자마자 다음 조회가 시작돼 executor를 여전히 100% 점유했다.
-        직전 소요시간에 비례시키는 규칙 자체는 이제 플랫폼
-        (platform.cache.AdaptiveTtlCache)이 들고 있고, 세션 공용 캐시를 통해
-        적용된다 — 그래서 다른 서비스가 같은 조회를 부르더라도 같은 보호를 받는다."""
-        from telemetryd.backend.procinfo import list_processes
-
-        return self._kernel.cached(
-            "procinfo.list_processes",
-            lambda: list_processes(self._ensure_program()),
-        )
-
     def list_processes(self, only_io: bool = False):
-        """게스트(또는 호스트) 커널의 프로세스 목록 + 관측된 I/O 활동을 합친다.
-
-        프로세스 정보는 drgn으로 task_struct에서 읽고(procinfo.py), I/O 활동은
-        eBPF 수집기 로그에서 읽는다 — 두 축이 만나야 "지금 이 SSD를 때리는
-        프로세스"를 이름 없이도 고를 수 있다(명세 1-1 (d)).
-
-        비싼 부분(프로세스 정보 조회)은 _proc_infos()가 캐시한다 — 그쪽
-        docstring 참고. 여기서 하는 합치기/필터링은 값싸므로 매번 새로 한다
-        (I/O 활동은 eBPF 로그 읽기라 저렴해서 항상 최신값이 반영된다)."""
-        from telemetryd.backend.targets import rule_matches
-        from telemetryd.models import ProcessListEntry
-
-        stats = self._process_stats()
-        io_by_pid = {}
-        for st in stats:
-            e = io_by_pid.setdefault(st.pid, {"rate": 0.0, "devices": set(), "comm": st.comm})
-            e["rate"] += st.iops
-            e["devices"].add(st.device)
-
-        procs = self._proc_infos()
-        rules = self._registry().rules
-        entries = []
-        seen = set()
-        for proc in procs:
-            seen.add(proc.pid)
-            io = io_by_pid.get(proc.pid)
-            matched = next((r for r in rules if rule_matches(r, proc)), None)
-            entry = ProcessListEntry(
-                info=proc,
-                io_active=bool(io and io["rate"] > 0),
-                io_rate=io["rate"] if io else 0.0,
-                target_devices=sorted(io["devices"]) if io else [],
-                is_target=matched is not None,
-                matched_rule=f"{matched.kind}={matched.value}" if matched else None,
-            )
-            if proc.error and "커널 스레드" in proc.error:
-                # [한국어] 커널 스레드는 대상으로 지정해도 의미가 없다(cmdline도
-                # 없고 워크로드 개념이 없음) — 목록에는 두되 선택 불가로.
-                entry.selectable = False
-                entry.unselectable_reason = "커널 스레드 — 프로파일 대상이 아님"
-            entries.append(entry)
-
-        # [한국어] 프로세스 목록에는 없는데 I/O는 잡힌 경우(순회 직후 종료 등)도
-        # 버리지 않고 최소 정보로 올린다 — 미관측 I/O 판단에 필요하다.
-        from telemetryd.models import ProcessInfo
-        for pid, io in io_by_pid.items():
-            if pid in seen:
-                continue
-            entries.append(ProcessListEntry(
-                info=ProcessInfo(pid=pid, comm=io["comm"],
-                                 error="프로세스 목록에서 사라짐(종료 중일 수 있음)"),
-                io_active=io["rate"] > 0, io_rate=io["rate"],
-                target_devices=sorted(io["devices"]),
-                selectable=False, unselectable_reason="이미 종료된 것으로 보임"))
-
-        if only_io:
-            entries = [e for e in entries if e.io_active]
-        entries.sort(key=lambda e: (-e.io_rate, e.info.pid))
-        return entries
+        """프로파일러 서비스로 위임(Facade)."""
+        return self._profiler.list_processes(only_io)
 
     def list_targets(self):
-        return list(self._registry().rules)
+        """프로파일러 서비스로 위임(Facade)."""
+        return self._profiler.list_targets()
 
     def add_target(self, rule):
-        self._registry().add_rule(rule)
-        return list(self._registry().rules)
+        """프로파일러 서비스로 위임(Facade)."""
+        return self._profiler.add_target(rule)
 
     def remove_target(self, kind: str, value: str):
-        self._registry().remove_rule(kind, value)
-        return list(self._registry().rules)
+        """프로파일러 서비스로 위임(Facade)."""
+        return self._profiler.remove_target(kind, value)
 
     def get_profile(self):
-        """세션/논리 그룹/기대 대조/미관측 I/O를 한 번에 만든 스냅샷.
-
-        StreamProfile이 2초 간격으로 부르므로 프로세스 정보는 반드시
-        _proc_infos()(캐시됨)로 얻는다 — 예전엔 여기서 procinfo.list_processes()를
-        직접 불러 2초마다 60~90초짜리 조회를 태우고 있었다(§9.16)."""
-        from telemetryd.models import ProfileSnapshot
-
-        stats = self._process_stats()
-        if not self._ebpf_log_path:
-            snap = self._registry().refresh(self._proc_infos(), [])
-            snap.available = False
-            snap.error = ("ebpf_log_path 미설정 — 프로세스별 I/O 수집 결과가 없어 "
-                          "세션은 만들어지지만 측정값이 비어 있다")
-            return snap
-        return self._registry().refresh(self._proc_infos(), stats)
+        """프로파일러 서비스로 위임(Facade)."""
+        return self._profiler.get_profile()
 
     def list_event_kinds(self):
         """이벤트 서비스로 위임(Facade)."""
