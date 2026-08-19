@@ -330,6 +330,28 @@ class DrgnQueueService:
         prp1 = int(cmd.common.dptr.prp1)
         prp2 = int(cmd.common.dptr.prp2)
         total_len, note = self._resolve_total_len(disk, qid, cid, cmd, is_admin)
+
+        # [한국어] IOMMU가 켜져 있으면 PRP1/PRP2는 물리주소가 아니라 **IOVA**다
+        # (디바이스가 보는 주소). 그런데 페이로드 덤프는 prog.read(..., physical=True)로
+        # 그 값을 물리주소로 간주해 읽으므로, IOVA를 그대로 읽으면 **엉뚱한 메모리를
+        # 읽거나(조용히 쓰레기 데이터) FaultError로 빈 페이지가 나온다**.
+        #
+        # 이 조건은 QEMU 검증 환경(IOMMU off)에서는 한 번도 안 걸렸지만, 실기
+        # 서버는 VT-d/AMD-Vi가 켜져 있는 경우가 흔하다. "조용히 틀린 값"이 가장
+        # 나쁜 실패 모드라, 읽지 않고 이유를 분명히 알려준다.
+        # (IOVA->물리 변환은 iommu_domain의 페이지테이블을 따라가야 하는데,
+        #  그건 이 도구가 아직 안 하는 별도 작업이다.)
+        if _iommu_enabled():
+            return PrpPayload(
+                device=device, qid=qid, cid=cid, uses_sgl=False,
+                total_len=total_len, pages=[],
+                error="IOMMU가 켜져 있어 PRP 페이로드를 덤프하지 않았다 — PRP1/PRP2가 "
+                      "물리주소가 아니라 IOVA라서 그대로 읽으면 엉뚱한 메모리를 읽는다. "
+                      "덤프가 필요하면 커널 부팅 옵션에서 IOMMU를 끄거나"
+                      "(intel_iommu=off / amd_iommu=off), IOVA->물리 변환을 거쳐야 한다. "
+                      "CDW/큐 상태 등 나머지 기능은 IOMMU와 무관하게 정상 동작한다.",
+            )
+
         pages = _decode_prp_pages(prog, prp1, prp2, total_len) if total_len > 0 else []
         return PrpPayload(device=device, qid=qid, cid=cid, uses_sgl=False, total_len=total_len,
                            pages=pages, error=note)

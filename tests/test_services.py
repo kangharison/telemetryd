@@ -160,3 +160,56 @@ def test_topology_gets_device_lookup_without_importing_queues():
     imported = {n.module for n in ast.walk(ast.parse(src))
                 if isinstance(n, ast.ImportFrom) and n.module}
     assert not any(m.startswith("telemetryd.services.queues") for m in imported)
+
+
+# ---- 실기(real machine) 대비 ------------------------------------------------
+
+def test_prp_dump_refuses_when_iommu_is_enabled(monkeypatch):
+    """IOMMU가 켜진 실기에서 PRP를 **조용히 틀리게** 읽지 않는지 고정한다.
+
+    PRP1/PRP2는 IOMMU가 켜지면 물리주소가 아니라 IOVA다. 덤프 코드는 그 값을
+    physical=True로 읽으므로 IOVA를 그대로 읽으면 엉뚱한 메모리를 읽거나 빈
+    페이지가 나온다 — QEMU 검증 환경(IOMMU off)에서는 절대 안 걸리지만 실기
+    서버는 VT-d/AMD-Vi가 켜져 있는 경우가 흔하다. "조용히 틀린 값"을 내느니
+    이유를 밝히고 안 읽는 게 맞다."""
+    import telemetryd.services.queues.service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "_iommu_enabled", lambda: True)
+
+    calls = []
+    monkeypatch.setattr(svc_mod, "_decode_prp_pages",
+                        lambda *a, **k: calls.append(1) or [])
+
+    # PRP 경로까지 가는 최소 가짜 커널 객체들
+    class _F:
+        def __init__(self, v): self._v = v
+        def __int__(self): return self._v
+
+    class _Common:
+        command_id, flags = _F(7), _F(0)          # PSDT=0 -> PRP 경로
+        class dptr:
+            prp1, prp2 = _F(0x1000), _F(0x2000)
+
+    class _Cmd:
+        common = _Common()
+
+    class _Q:
+        q_depth, sq_cmds = _F(1), object()
+
+    class _Dev:
+        online_queues = _F(1)
+        queues = [_Q()]
+
+    service = svc_mod.DrgnQueueService(kernel=type("K", (), {"program": lambda s: None})())
+    monkeypatch.setattr(service, "lookup_device", lambda d: (_Dev(), object()))
+    monkeypatch.setattr(service, "_resolve_total_len", lambda *a: (4096, None))
+    # [한국어] service.py가 함수 안에서 `from drgn import cast` 하므로 모듈
+    # 속성 패치로는 안 잡힌다 — drgn 모듈 자체를 패치해야 한다.
+    import drgn
+    monkeypatch.setattr(drgn, "cast", lambda *a: [_Cmd()])
+
+    payload = service.get_prp_payload("nvme0", 0, 7)
+
+    assert payload.pages == []
+    assert "IOMMU" in payload.error
+    assert not calls, "IOMMU가 켜졌는데도 물리주소를 읽으려 시도했다"

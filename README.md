@@ -15,6 +15,75 @@ python3 -m venv .venv
 .venv/bin/pytest -v
 ```
 
+## 실기(real machine)에서 쓰기 — QEMU 없이
+
+이 저장소의 검증은 **QEMU 게스트**에서 이뤄졌다(DESIGN.md §9). 검증 환경에서
+root를 못 써서 QMP로 게스트에 붙는 우회를 썼기 때문인데, **실기에서는 그
+우회가 전혀 필요 없고 오히려 방해가 된다.** 실기에서는 아래만 하면 된다.
+
+### 1. 커널 접근 — QMP 대신 로컬 + root
+
+```bash
+# QEMU 검증 환경에서 쓰던 방식(실기에서는 불필요)
+#   --qemu-qmp /path/qmp.sock --qemu-vmlinux /path/vmlinux
+
+# 실기: 로컬 커널을 직접 읽는다. /proc/kcore 접근이라 root 필요.
+sudo -E .venv/bin/telemetryd --backend drgn doctor
+sudo -E .venv/bin/telemetryd --backend drgn snapshot nvme0
+```
+
+`doctor`를 먼저 돌려 심볼/권한/수집기 상태를 확인하는 걸 권한다.
+
+**커널 디버그 심볼이 필요하다.** 배포판 패키지로 설치하거나(`debuginfod`가
+설정돼 있으면 자동), 없으면 `--extra-symbols /path/to/vmlinux`로 명시한다.
+
+> ⚠️ **이 로컬 경로(`program_from_kernel()`)는 이 저장소에서 실제로 검증되지
+> 않았다.** 검증 환경에서 root를 쓸 수 없었기 때문이다(DESIGN.md 상단 경고).
+> 코드 경로 자체는 QMP 모드와 대부분을 공유하지만, 실기에서 처음 돌릴 때는
+> `doctor` → `snapshot` → 나머지 순으로 하나씩 확인하길 권한다.
+
+### 2. eBPF 수집기 — chroot 없이 그냥 실행
+
+QEMU 검증에서는 게스트에 bpftrace가 없어 9p+chroot로 호스트 바이너리를 빌려
+썼다. 실기에서는 그냥 설치해서 돌리면 된다.
+
+```bash
+sudo bpftrace ebpf/nvme_perf.bt >> /var/log/nvme_perf.log 2>&1 &
+sudo -E .venv/bin/telemetryd --backend drgn --ebpf-log /var/log/nvme_perf.log perf nvme0
+```
+
+필요 조건: `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_EVENTS`, `CONFIG_DEBUG_INFO_BTF`,
+`CONFIG_PERF_EVENTS`. 배포판 커널은 보통 다 켜져 있다.
+
+### 3. ⚠️ IOMMU가 켜져 있으면 PRP 페이로드 덤프가 안 된다
+
+**실기에서 가장 먼저 부딪힐 차이점이다.** IOMMU(VT-d/AMD-Vi)가 켜지면
+PRP1/PRP2는 물리주소가 아니라 **IOVA**(디바이스가 보는 주소)라서, 그 값을
+물리주소로 읽으면 엉뚱한 메모리를 읽는다. 검증 환경은 IOMMU가 꺼져 있어
+이 조건에 한 번도 안 걸렸다.
+
+지금 코드는 이 경우 **덤프를 하지 않고 이유를 반환한다** — 조용히 틀린 값을
+주는 게 가장 나쁜 실패 모드이기 때문이다. `snapshot` 출력의 `iommu=on/off`로
+현재 상태를 볼 수 있다.
+
+- PRP 페이로드가 꼭 필요하면: 커널 부팅 옵션에서 IOMMU를 끈다
+  (`intel_iommu=off` 또는 `amd_iommu=off`)
+- **그 외 기능(큐 상태, CDW, 성능, 이벤트, 토폴로지, 프로파일러)은 IOMMU와
+  무관하게 정상 동작한다.**
+
+### 4. 커널 버전 차이
+
+검증은 **Linux 6.1.4** 기준이다. 다른 버전에서는 커널 구조체 필드가 달라
+일부 조회가 실패할 수 있다(이미 `cdw2/cdw3`처럼 버전별 분기를 둔 곳도 있다).
+`doctor`와 `snapshot`이 먼저 깨지므로 거기서 드러난다.
+
+### 5. QEMU 전용 스크립트는 무시해도 된다
+
+`scripts/qemu_run_guest.sh`, `guest_fio_load.sh`, `guest_fio_profile.sh`,
+`guest_start_ssh.sh`, `qemu_verify.sh` 는 전부 **검증 환경 재현용**이다.
+실기에서는 쓸 일이 없다(기본 경로도 검증 세션의 임시 디렉터리를 가리킨다).
+실기에서 부하가 필요하면 fio를 평소대로 직접 실행하면 된다.
+
 ## CLI (순수 라이브러리 import, gRPC 안 거침)
 
 ```bash
