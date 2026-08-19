@@ -52,6 +52,7 @@ from telemetryd.models import (
     TreeNode,
 )
 from telemetryd.nvme_const import ADM_OPC, MAX_PAGE_DUMP, NVM_OPC, PAGE_SIZE, opcode_name
+from telemetryd.services.perf import MockPerfService
 
 MAX_DEPTH = 10          # treewalk.py의 실제 규칙과 동일 (§DESIGN 5.5) — 여기선 drgn 비의존을 위해 상수 중복
 MAX_ARRAY_CHILDREN = 64
@@ -124,6 +125,11 @@ class MockBackend:
         # 있게 주입 가능하게 둔다(기본은 실제 데몬과 같은 XDG state 경로).
         self._target_state = target_state
         self._targets = None
+        # [한국어] 도메인별 서비스(services/*)의 mock 구현. 이 백엔드는 그 앞의
+        # 파사드다 — DrgnBackend와 같은 구조를 유지해야 둘을 바꿔 끼울 수 있다.
+        self._perf = MockPerfService(
+            queues_of=lambda device: self._topology(device)["online_queues"]
+        )
 
     def list_devices(self) -> List[str]:
         return list(_TOPOLOGY.keys())
@@ -321,54 +327,11 @@ class MockBackend:
     # ---- eBPF 실시간 성능 (요청사항: "device/개별 queue별로 iops/bandwidth/latency") --
 
     def get_performance(self, device: str) -> DevicePerf:
-        topo = self._topology(device)
-        online = topo["online_queues"]
-        t = _tick()
-        queues = []
-        for idx in range(1, online):  # admin 큐는 IOPS 개념이 희박해 IO 큐만 합성
-            phase = t + idx * 11
-            read_iops = float(500 + (phase * 37) % 3000)
-            write_iops = float(300 + (phase * 23) % 2000)
-            avg_seg = 4096 + (phase % 4) * 12288  # 4KB~52KB 사이를 오가는 평균 전송 크기 흉내
-            bw = (read_iops + write_iops) * avg_seg
-            lat = float(80 + (phase * 7) % 900)
-            # [한국어] percentile은 실제 히스토그램이 없으니 avg 기준으로 꼬리를
-            # 흉내낸 배수로 합성한다(p50 < avg < p95 < p99 < p99.9, 실측 eBPF
-            # 히스토그램의 전형적인 모양을 대략 재현 — 정확한 분포는 아님).
-            queues.append(
-                QueuePerf(
-                    qid=idx,
-                    iops=read_iops + write_iops,
-                    read_iops=read_iops,
-                    write_iops=write_iops,
-                    bandwidth_bytes_per_sec=bw,
-                    avg_latency_us=lat,
-                    p50_latency_us=lat * 0.85,
-                    p95_latency_us=lat * 2.0,
-                    p99_latency_us=lat * 4.0,
-                    p999_latency_us=lat * 8.0,
-                )
-            )
-        aggregate = None
-        if queues:
-            n = len(queues)
-            total_iops = sum(q.iops for q in queues)
-            total_read = sum(q.read_iops for q in queues)
-            total_write = sum(q.write_iops for q in queues)
-            total_bw = sum(q.bandwidth_bytes_per_sec for q in queues)
-            aggregate = QueuePerf(
-                qid=-1,
-                iops=total_iops,
-                read_iops=total_read,
-                write_iops=total_write,
-                bandwidth_bytes_per_sec=total_bw,
-                avg_latency_us=sum(q.avg_latency_us for q in queues) / n,
-                p50_latency_us=sum(q.p50_latency_us for q in queues) / n,
-                p95_latency_us=sum(q.p95_latency_us for q in queues) / n,
-                p99_latency_us=sum(q.p99_latency_us for q in queues) / n,
-                p999_latency_us=sum(q.p999_latency_us for q in queues) / n,
-            )
-        return DevicePerf(device=device, queues=queues, available=True, aggregate=aggregate)
+        """성능 서비스(mock)로 위임 — 로직은 services/perf/mock.py 에 있다.
+        큐 개수만 이 백엔드의 토폴로지에서 알려준다(서비스가 다른 서비스를
+        직접 import하지 않는다는 규칙 때문에 콜백으로 주입)."""
+        self._topology(device)          # 없는 디바이스면 DeviceNotFoundError
+        return self._perf.get_performance(device)
 
     def get_events(self, device: str) -> List[NvmeEvent]:
         # [한국어] 타임아웃/리셋 같은 이벤트는 정상적으로는 거의 안 일어나는

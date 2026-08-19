@@ -23,6 +23,7 @@ from telemetryd.models import CompletionEntry, DeviceSnapshot, PrpPage, PrpPaylo
 from telemetryd.nvme_const import MAX_PAGE_DUMP, PAGE_MASK, PAGE_SIZE, PRPS_PER_PAGE, opcode_name
 from telemetryd.platform.ebpf import as_log_source
 from telemetryd.platform.kernel import DrgnKernelSession
+from telemetryd.services.perf import EbpfPerfService
 from telemetryd import treewalk
 
 
@@ -169,6 +170,9 @@ class DrgnBackend:
         self._ebpf = as_log_source(ebpf_log_path)
         # [한국어] 하위호환: 기존 코드/테스트가 참조하던 경로 속성은 남겨둔다.
         self._ebpf_log_path = ebpf_log_path
+        # [한국어] 도메인별 서비스(services/*)로 옮겨간 것들. 이 백엔드는 이제
+        # 그 서비스들 앞의 파사드 역할을 하며, 옮겨간 메서드는 위임만 한다.
+        self._perf = EbpfPerfService(self._ebpf)
         # [한국어] TimeoutEventReader는 "마지막으로 읽은 파일 오프셋 +
         # 최근 이벤트 링버퍼" 상태를 들고 있어야 해서(로그를 매번 통째로
         # 다시 읽지 않으려고, DESIGN.md §9.11) 이 backend 인스턴스 생명주기
@@ -480,16 +484,13 @@ class DrgnBackend:
     # ---- eBPF 실시간 성능 (drgn과 무관 — 순수 파일 읽기, DESIGN.md §6/§9.5) ------
 
     def get_performance(self, device: str):
-        from telemetryd.backend.ebpf_perf import read_device_performance
-        from telemetryd.models import DevicePerf
+        """성능 서비스로 위임(Facade).
 
-        if not self._ebpf_log_path:
-            return DevicePerf(
-                device=device, queues=[], available=False,
-                error="ebpf_log_path 미설정 — DrgnBackend(ebpf_log_path=...) 로 "
-                "bpftrace 출력 파일 경로를 지정해야 함",
-            )
-        return read_device_performance(self._ebpf_log_path, device)
+        이 백엔드는 리팩토링 동안 기존 호출부(gRPC 서버/CLI/웹)를 안 깨뜨리려고
+        남겨둔 **파사드**다 — 실제 로직은 services/perf 로 옮겨졌다. 서비스가
+        전부 이사하면 이 클래스는 얇은 위임만 남고, 그때 호출부를 서비스에
+        직접 붙이면서 걷어낼 수 있다(services/__init__.py 의 규칙 참고)."""
+        return self._perf.get_performance(device)
 
     def get_events(self, device: str):
         """이 디바이스의 최근 NVMe 이벤트 목록(종류 무관 — base.py 참고).
