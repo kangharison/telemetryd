@@ -113,3 +113,50 @@ def test_registry_swaps_implementations_without_touching_callers():
 
     assert caller(mock_reg).available is True
     assert caller(ebpf_reg).available is False     # 구현만 다르고 호출은 동일
+
+
+# ---- 조립 루트(composition root) -------------------------------------------
+
+def test_monolith_mock_registry_wires_services():
+    from telemetryd.composition import build_monolith_mock
+
+    reg = build_monolith_mock()
+    assert reg.names() == ["events", "perf", "profiler"]
+    assert reg.get("perf").get_performance("nvme0").available is True
+
+
+def test_monolith_drgn_registry_wires_all_five_services():
+    """drgn 조립은 서비스 5개를 전부 등록한다. 여기서는 커널에 실제로 붙지
+    않는다 — DrgnKernelSession이 Program을 **지연 생성**하기 때문이라,
+    조립 자체는 drgn 없이도 검증할 수 있다(그 지연 생성이 곧 이 테스트의
+    가치이기도 하다)."""
+    from telemetryd.composition import build_monolith_drgn
+
+    reg = build_monolith_drgn(ebpf_log_path=None)
+    assert reg.names() == ["events", "perf", "profiler", "queues", "topology"]
+
+
+def test_services_share_one_kernel_session(tmp_path):
+    """큐/토폴로지/프로파일러가 **같은** 커널 세션을 공유해야 한다.
+
+    세션을 서비스마다 따로 만들면 캐시도 따로 생겨서, 비싼 조회가 서비스 수만큼
+    반복된다 — DESIGN.md §9.16에서 대시보드를 멈춘 문제가 그대로 재현되는
+    구조다. 조립 루트가 그걸 막고 있는지 고정한다."""
+    from telemetryd.composition import build_monolith_drgn
+
+    reg = build_monolith_drgn(ebpf_log_path=str(tmp_path / "log"))
+    queues = reg.get("queues")
+    profiler = reg.get("profiler")
+    assert queues._kernel is profiler._kernel
+
+
+def test_topology_gets_device_lookup_without_importing_queues():
+    """토폴로지는 큐 서비스를 import하지 않고 콜러블만 주입받는다 — 이게
+    지켜져야 두 서비스를 서로 다른 프로세스로 뗄 수 있다."""
+    import ast, pathlib
+    import telemetryd.services.topology.service as topo_mod
+
+    src = pathlib.Path(topo_mod.__file__).read_text()
+    imported = {n.module for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.ImportFrom) and n.module}
+    assert not any(m.startswith("telemetryd.services.queues") for m in imported)
