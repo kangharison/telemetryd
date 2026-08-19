@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+cpp/build/
+src/telemetryd/grpcserver/*_pb2.py
+src/telemetryd/grpcserver/*_pb2_grpc.py
+src/telemetryd/grpcserver/*_pb2.pyi
+.pytest_cache/

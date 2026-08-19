@@ -1,0 +1,342 @@
+// telemetryd eBPF NVMe 성능 수집기 — DESIGN.md §6(eBPF 역할)의 실제 구현.
+//
+// nvme:nvme_setup_cmd(제출)/nvme:nvme_complete_rq(완료) 트레이스포인트로
+// (ctrl_id, qid)별 IOPS/대역폭/평균 레이턴시 + p50/p95/p99/p99.9 레이턴시
+// 히스토그램을 1초 간격으로 집계해서 stdout에 bpftrace 네이티브 맵 덤프
+// 형식(스칼라는 `@name[k1, k2]: v` 한 줄, 히스토그램(@lat_hist)은 `@name[k1, k2]:`
+// 뒤에 2배수 버킷 여러 줄)으로 찍는다. ctrl_id는
+// struct nvme_ctrl.instance — telemetryd의 "nvme{N}" 디바이스 번호와 그대로
+// 일치한다(드라이버가 disk_name을 "nvme%dn%d"로 이 instance에서 만듦).
+//
+// 추가로 kprobe:nvme_timeout으로 NVMe 커맨드 타임아웃(요청 미완료로 blk-mq가
+// nvme_timeout()을 부르는 경우)을 훅해서, 그 커맨드가 nvme_setup_cmd 때
+// 캐시해 둔 CDW(opcode/nsid/flags/cdw10-15)와 함께 "TIMEOUT_EVENT " 로
+// 시작하는 한 줄을 즉시 찍는다(주기 틱과 무관한 이벤트 로그 — DESIGN.md
+// §9.11). 타임아웃 시점엔 원본 커맨드가 이미 struct request에서 직접
+// 안 보여서(§9.11에 기록) 제출 시점에 미리 캐시해 두는 방식을 쓴다.
+//
+// JSON을 bpftrace 안에서 직접 만들지 않고 네이티브 맵 덤프를 쓰는 이유: 문자열
+// 포매팅이 bpftrace 언어로는 번거롭고 취약해서, 파싱은 호스트 쪽 Python
+// (backend/ebpf_perf.py, backend/ebpf_timeout_events.py)이 정규식으로 한다 —
+// 훨씬 덜 취약하고 디버깅하기 쉽다.
+//
+// 실행(게스트 안, 9p+chroot로 호스트 bpftrace를 게스트 커널에 붙임 — DESIGN.md §9):
+//   chroot /mnt/host /usr/bin/bpftrace /path/to/nvme_perf.bt \
+//     >> /mnt/ebpf/nvme_perf.log 2>&1 &
+
+BEGIN
+{
+	printf("nvme_perf.bt attached\n");
+}
+
+tracepoint:nvme:nvme_setup_cmd
+{
+	@start[args->ctrl_id, args->qid, args->cid] = nsecs;
+	// [한국어] NLB(전송 블록 수, 0-based)는 cdw12 하위 16비트 — cdw10[24] 바이트
+	// 배열에서 cdw10=[0:4), cdw11=[4:8), cdw12=[8:12) 이므로 offset 8,9가 그것.
+	// read(0x02)/write(0x01)에만 의미 있음(admin 커맨드는 NLB 자체가 없음).
+	// [한국어] NLB를 먼저 무조건 계산해 둔다(아래 프로세스별 집계에서도 씀).
+	// read/write가 아니면 의미 없는 값이지만 쓰지 않으므로 무해하다.
+	$b8 = (uint16)args->cdw10[8];
+	$b9 = (uint16)args->cdw10[9];
+	$nlb = ($b9 << 8) | $b8;
+	if (args->opcode == 1 || args->opcode == 2) {
+		@bytes_sum[args->ctrl_id, args->qid] += ($nlb + 1) * 512;
+	}
+	if (args->opcode == 1) {
+		@write_count[args->ctrl_id, args->qid] += 1;
+	}
+	if (args->opcode == 2) {
+		@read_count[args->ctrl_id, args->qid] += 1;
+	}
+
+	// [한국어] === 프로세스/스레드 단위 수집 (범용 프로파일러의 "탐색 모드") ===
+	// 왜 여기인가: nvme_setup_cmd는 **제출한 컨텍스트**에서 실행되므로 이
+	// 시점의 pid/tid/comm가 "누가 이 I/O를 냈는가"에 가장 가깝다. 완료 훅
+	// (nvme_complete_rq)은 인터럽트/커널 스레드 컨텍스트라 그 정보가 없다.
+	//
+	// ⚠ 귀속의 한계: O_DIRECT 제출은 발행 프로세스 컨텍스트에서 일어나지만
+	// (fio --direct=1, io_uring/libaio 모두), 버퍼드 쓰기의 writeback은
+	// kworker/flush 커널 스레드가 대신 제출한다 — 그 경우 여기 잡히는 건
+	// 원래 프로세스가 아니라 커널 스레드다. 호스트 쪽이 그 사실을 그대로
+	// 표시하도록 comm을 키에 같이 넣는다(가짜 귀속을 만들지 않는다).
+	//
+	// bpftrace 빌트인: pid = TGID(프로세스), tid = 스레드 ID.
+	@proc_ops[args->ctrl_id, pid, comm] = count();
+	@thr_ops[args->ctrl_id, pid, tid, comm] = count();
+	// [한국어] 이 프로세스가 어느 큐를 쓰는지 — 여러 프로세스가 같은 hctx를
+	// 공유하면 경합이 생기므로 교차 집계에 필요하다(명세 2-2).
+	@proc_q[args->ctrl_id, pid, args->qid] = count();
+
+	if (args->opcode == 1 || args->opcode == 2) {
+		// [한국어] 위에서 이미 구한 $nlb 재사용 — 실제 전송 바이트.
+		$pbytes = ($nlb + 1) * 512;
+		@proc_bytes[args->ctrl_id, pid] += $pbytes;
+		// [한국어] I/O 크기 분포 — 어댑터가 "기대 bs vs 실측 bs"를 대조하는
+		// 근거(명세 3-2의 핵심 가치: --bs=128k인데 SQE가 4K로 나가는 상황).
+		@proc_bs[args->ctrl_id, pid, $pbytes] = count();
+	}
+	if (args->opcode == 1) { @proc_wr[args->ctrl_id, pid] = count(); }
+	if (args->opcode == 2) { @proc_rd[args->ctrl_id, pid] = count(); }
+
+	// [한국어] 순차/랜덤 패턴 측정 — "기대 워크로드 vs 실측"(명세 3-2)의 항목
+	// 중 하나. 직전 I/O가 끝난 LBA와 이번 시작 LBA가 이어지면 순차로 센다.
+	// 프로세스 단위로 직전 위치를 들고 있으므로, 한 프로세스가 여러 스레드로
+	// 서로 다른 영역을 동시에 읽으면 실제보다 랜덤하게 보일 수 있다 —
+	// 근사치임을 호스트 쪽 모델(inferred/근사 표기)에서 밝힌다.
+	if (args->opcode == 1 || args->opcode == 2) {
+		$slba = ((uint64)args->cdw10[4] | ((uint64)args->cdw10[5] << 8)
+			| ((uint64)args->cdw10[6] << 16) | ((uint64)args->cdw10[7] << 24)) << 32
+			| ((uint64)args->cdw10[0] | ((uint64)args->cdw10[1] << 8)
+			| ((uint64)args->cdw10[2] << 16) | ((uint64)args->cdw10[3] << 24));
+		$prev_end = @last_lba_end[args->ctrl_id, pid];
+		if ($prev_end != 0 && $slba == $prev_end) {
+			@proc_seq[args->ctrl_id, pid] = count();
+		} else {
+			@proc_rand[args->ctrl_id, pid] = count();
+		}
+		@last_lba_end[args->ctrl_id, pid] = $slba + $nlb + 1;
+	}
+	// [한국어] 완료 시점에는 제출자 정보가 없으므로, 커맨드 식별자에 tgid를
+	// 매달아 둔다 — 완료 훅에서 이걸로 프로세스별 레이턴시를 집계한다.
+	@cmd_tgid[args->ctrl_id, args->qid, args->cid] = pid;
+
+	// [한국어] 타임아웃 이벤트용 CDW 캐시 — (ctrl,qid,tag)로 키를 잡는다.
+	// tag(=blk-mq 태그, req->tag)는 cid의 하위 12비트와 같다
+	// (nvme_cid() = genctr<<12 | tag, drivers/nvme/host/nvme.h) — kprobe:
+	// nvme_timeout에서는 struct request->tag를 바로 읽을 수 있지만 genctr는
+	// struct nvme_request까지 더 들어가야 해서, 애초에 genctr 없는 tag로
+	// 캐시 키를 통일해 lookup을 단순하게 만든다.
+	$tag = args->cid & 0xfff;
+	@to_ts[args->ctrl_id, args->qid, $tag] = nsecs;
+	@to_opcode[args->ctrl_id, args->qid, $tag] = (int64)args->opcode;
+	@to_nsid[args->ctrl_id, args->qid, $tag] = (int64)args->nsid;
+	@to_flags[args->ctrl_id, args->qid, $tag] = (int64)args->flags;
+	@to_cdw10[args->ctrl_id, args->qid, $tag] = (uint32)args->cdw10[0] | ((uint32)args->cdw10[1] << 8) | ((uint32)args->cdw10[2] << 16) | ((uint32)args->cdw10[3] << 24);
+	@to_cdw11[args->ctrl_id, args->qid, $tag] = (uint32)args->cdw10[4] | ((uint32)args->cdw10[5] << 8) | ((uint32)args->cdw10[6] << 16) | ((uint32)args->cdw10[7] << 24);
+	@to_cdw12[args->ctrl_id, args->qid, $tag] = (uint32)args->cdw10[8] | ((uint32)args->cdw10[9] << 8) | ((uint32)args->cdw10[10] << 16) | ((uint32)args->cdw10[11] << 24);
+	@to_cdw13[args->ctrl_id, args->qid, $tag] = (uint32)args->cdw10[12] | ((uint32)args->cdw10[13] << 8) | ((uint32)args->cdw10[14] << 16) | ((uint32)args->cdw10[15] << 24);
+	@to_cdw14[args->ctrl_id, args->qid, $tag] = (uint32)args->cdw10[16] | ((uint32)args->cdw10[17] << 8) | ((uint32)args->cdw10[18] << 16) | ((uint32)args->cdw10[19] << 24);
+	@to_cdw15[args->ctrl_id, args->qid, $tag] = (uint32)args->cdw10[20] | ((uint32)args->cdw10[21] << 8) | ((uint32)args->cdw10[22] << 16) | ((uint32)args->cdw10[23] << 24);
+}
+
+tracepoint:nvme:nvme_complete_rq
+{
+	// [한국어] 맵에 없는 키는 0 반환(bpftrace 기본 동작) — 그걸로 "짝이 되는
+	// setup_cmd를 못 봤다"(bpftrace 시작 전에 이미 in-flight였던 커맨드 등)를 거른다.
+	$t0 = @start[args->ctrl_id, args->qid, args->cid];
+	if ($t0 != 0) {
+		$lat = nsecs - $t0;
+		@lat_sum[args->ctrl_id, args->qid] += $lat;
+		@lat_count[args->ctrl_id, args->qid] += 1;
+		@op_count[args->ctrl_id, args->qid] += 1;
+		// [한국어] p50/p95/p99/p99.9(QoS "nine" 표기) 근사 계산용 — bpftrace의
+		// 2배수(log2) 버킷 히스토그램. avg_latency_us(=lat_sum/lat_count)는
+		// 꼬리 지연을 못 보여주는데, 이 히스토그램의 누적분포로 호스트 쪽
+		// (backend/ebpf_perf.py)이 percentile을 버킷 상한 근사치로 뽑는다.
+		@lat_hist[args->ctrl_id, args->qid] = hist($lat);
+		// [한국어] 프로세스별 평균 레이턴시 — 제출 때 매달아 둔 tgid로 귀속.
+		// 이 값과 IOPS로 Little의 법칙(QD ≈ IOPS × 지연)을 써서 실측 큐 깊이를
+		// 근사한다(호스트 쪽 계산). 완료 컨텍스트의 pid를 쓰면 인터럽트
+		// 핸들러/커널 스레드로 잘못 귀속되므로 반드시 이 매핑을 거쳐야 한다.
+		$otgid = @cmd_tgid[args->ctrl_id, args->qid, args->cid];
+		if ($otgid != 0) {
+			@proc_lat_sum[args->ctrl_id, $otgid] += $lat;
+			@proc_lat_cnt[args->ctrl_id, $otgid] += 1;
+		}
+		delete(@start[args->ctrl_id, args->qid, args->cid]);
+	}
+	delete(@cmd_tgid[args->ctrl_id, args->qid, args->cid]);
+
+	// [한국어] 제출 시점 캐시(@to_*)의 키 — cid 하위 12비트가 blk-mq 태그다.
+	// 아래 에러 캡처와 캐시 삭제가 함께 쓰므로 여기서 한 번만 만든다.
+	$tag = args->cid & 0xfff;
+
+	// [한국어] === A2: 에러 status 캡처 (status != 0인 완료) ===
+	// 왜 필요한가: 실무에서 디바이스 이상 징후 중 타임아웃까지 가는 건 극히
+	// 일부다. 대부분은 그 전에 에러 status로 반환되고 blk-mq/nvme 코어가
+	// 재시도(nvme_retry_req)로 흡수해버려서 애플리케이션에서는 안 보인다 —
+	// 그래서 완료 경로에서 직접 잡아야 한다.
+	//
+	// status 비트 배치: 이 트레이스포인트의 status는 nvme_req(req)->status라
+	// 이미 `le16_to_cpu(cqe->status) >> 1`로 phase 비트가 제거된 값이다
+	// (drivers/nvme/host/nvme.h nvme_try_complete_req). 따라서:
+	//   SC   = bits[7:0]   상태 코드
+	//   SCT  = bits[10:8]  상태 코드 타입(0=Generic, 1=Command Specific,
+	//                      2=Media/Data Integrity, 3=Path Related, 7=Vendor)
+	//   CRD  = bits[12:11] Command Retry Delay (NVME_SC_CRD = 0x1800)
+	//   More = bit[13]     추가 정보가 에러 로그에 있음 (NVME_SC_MORE = 0x2000)
+	//   DNR  = bit[14]     Do Not Retry — 상위가 재시도로 흡수 못 하는 진짜 실패
+	// (include/linux/nvme.h의 NVME_SC_CRD/MORE/DNR 마스크와 그대로 일치)
+	if (args->status != 0) {
+		$sc = (uint64)(args->status & 0xff);
+		$sct = (uint64)((args->status >> 8) & 0x7);
+		$crd = (uint64)((args->status >> 11) & 0x3);
+		$more = (uint64)((args->status >> 13) & 0x1);
+		$dnr = (uint64)((args->status >> 14) & 0x1);
+
+		// [한국어] SLBA/NLB는 완료 이벤트에 없다 — 타임아웃과 똑같이 제출
+		// 시점(nvme_setup_cmd)에 (ctrl,qid,tag)로 캐시해 둔 CDW에서 복원한다.
+		// read/write(opcode 1/2)에서 cdw10=SLBA[31:0], cdw11=SLBA[63:32],
+		// cdw12[15:0]=NLB(0-based)이므로 +1 해야 실제 블록 수가 된다. 다른
+		// opcode에서는 이 자리가 LBA가 아니므로 호스트 파서가 opcode를 보고
+		// 무시한다(cached=0이면 제출을 못 본 커맨드 — 값 자체가 무의미).
+		$ets = @to_ts[args->ctrl_id, args->qid, $tag];
+		$cached = $ets != 0 ? 1 : 0;
+		$eelapsed = $ets != 0 ? (nsecs - $ets) : (uint64)0;
+		$slba = ((uint64)@to_cdw11[args->ctrl_id, args->qid, $tag] << 32)
+			| (uint64)@to_cdw10[args->ctrl_id, args->qid, $tag];
+		$nlb = (@to_cdw12[args->ctrl_id, args->qid, $tag] & 0xffff) + 1;
+
+		// [한국어] 로그 폭주 방지 — 컨트롤러가 망가져 모든 커맨드가 실패하면
+		// 초당 수만 줄이 찍혀 로그 파일이 순식간에 GB로 자란다. 초당 인쇄
+		// 예산(@err_budget, interval에서 리셋)으로 상한을 두되, 누적 카운터
+		// (@err_count)는 예산과 무관하게 전부 센다 — "몇 건 났는지"는 정확히
+		// 유지하고 "각 건의 상세"만 샘플링하는 것.
+		$budget = @err_budget[args->ctrl_id];
+		if ($budget < 50) {
+			@err_budget[args->ctrl_id] = $budget + 1;
+			printf("ERROR_EVENT ts_ns=%lld ctrl=%d qid=%d cid=%d tag=%d opcode=%lld nsid=%lld status=%d sct=%lld sc=%lld dnr=%lld more=%lld crd=%lld slba=%llu nlb=%lld retries=%d cached=%d elapsed_ns=%lld\n",
+				nsecs, args->ctrl_id, args->qid, args->cid, $tag,
+				@to_opcode[args->ctrl_id, args->qid, $tag],
+				@to_nsid[args->ctrl_id, args->qid, $tag],
+				args->status, $sct, $sc, $dnr, $more, $crd,
+				$slba, $nlb, args->retries, $cached, $eelapsed);
+		}
+
+		// [한국어] SCT/SC 조합별 누적 카운터 — 이벤트 줄과 별개로 유지한다.
+		// interval에서 clear하지 않으므로(다른 성능 맵과 다른 점) 수집기가
+		// 뜬 이후의 누적 총계가 매 틱 그대로 다시 찍힌다. "지금 초당 몇 건"이
+		// 아니라 "여태 어떤 에러가 몇 번"을 보는 용도라 누적이 맞다.
+		@err_count[args->ctrl_id, $sct, $sc] += 1;
+	}
+
+	// [한국어] 정상 완료됐으니 타임아웃 CDW 캐시도 지운다 — 안 지우면 태그가
+	// 재사용될 때마다 맵이 계속 쌓인다(태그 개수는 큐 depth로 유한하지만,
+	// 오래된 값이 덮어써지기 전에 불필요하게 남아있을 이유가 없다).
+	delete(@to_ts[args->ctrl_id, args->qid, $tag]);
+	delete(@to_opcode[args->ctrl_id, args->qid, $tag]);
+	delete(@to_nsid[args->ctrl_id, args->qid, $tag]);
+	delete(@to_flags[args->ctrl_id, args->qid, $tag]);
+	delete(@to_cdw10[args->ctrl_id, args->qid, $tag]);
+	delete(@to_cdw11[args->ctrl_id, args->qid, $tag]);
+	delete(@to_cdw12[args->ctrl_id, args->qid, $tag]);
+	delete(@to_cdw13[args->ctrl_id, args->qid, $tag]);
+	delete(@to_cdw14[args->ctrl_id, args->qid, $tag]);
+	delete(@to_cdw15[args->ctrl_id, args->qid, $tag]);
+}
+
+// [한국어] nvme_timeout()은 struct request 하나만 받는 blk_mq_ops.timeout
+// 콜백(drivers/nvme/host/pci.c) — struct request->mq_hctx->driver_data가
+// 이 PCI 드라이버에서는 struct nvme_queue*(hctx 초기화 때 그렇게 심어둠),
+// 거기서 ->dev->ctrl.instance로 ctrl_id를, ->qid로 큐 번호를 얻는다. 이
+// 체인과 kprobe 안전성은 라이브 게스트에서 단계별로 직접 확인했다
+// (DESIGN.md §9.11 — 처음엔 포그라운드 tty에서 실행 중 게스트가 죽어서
+// 이 프로브 자체가 원인인 줄 알았으나, 백그라운드로 같은 프로브를 단계별로
+// 재현했을 때는 전혀 문제없었다 — eBPF 검증기가 애초에 잘못된 포인터 읽기로
+// 커널을 죽이는 걸 허용하지 않으므로, 실제 원인은 다른 곳이었을 가능성이 큼).
+kprobe:nvme_timeout
+{
+	$req = (struct request *)arg0;
+	$hctx = $req->mq_hctx;
+	$nvmeq = (struct nvme_queue *)$hctx->driver_data;
+	$dev = $nvmeq->dev;
+	$ctrl = $dev->ctrl.instance;
+	$qid = $nvmeq->qid;
+	$tag = $req->tag;
+	$t0 = @to_ts[$ctrl, $qid, $tag];
+	$elapsed = $t0 != 0 ? (nsecs - $t0) : (uint64)0;
+	printf("TIMEOUT_EVENT ts_ns=%lld ctrl=%d qid=%d tag=%d opcode=%d nsid=%d flags=%d cdw10=%u cdw11=%u cdw12=%u cdw13=%u cdw14=%u cdw15=%u elapsed_ns=%lld\n",
+		nsecs, $ctrl, $qid, $tag,
+		@to_opcode[$ctrl, $qid, $tag], @to_nsid[$ctrl, $qid, $tag], @to_flags[$ctrl, $qid, $tag],
+		@to_cdw10[$ctrl, $qid, $tag], @to_cdw11[$ctrl, $qid, $tag], @to_cdw12[$ctrl, $qid, $tag],
+		@to_cdw13[$ctrl, $qid, $tag], @to_cdw14[$ctrl, $qid, $tag], @to_cdw15[$ctrl, $qid, $tag],
+		$elapsed);
+}
+
+interval:s:1
+{
+	print(@op_count);
+	print(@read_count);
+	print(@write_count);
+	print(@bytes_sum);
+	print(@lat_sum);
+	print(@lat_count);
+	print(@lat_hist);
+	// [한국어] @err_count는 누적 카운터라 print만 하고 clear하지 않는다(아래
+	// clear 목록에도 없음). 호스트 파서는 "마지막으로 끝난 틱"의 이 블록을
+	// 읽어 SCT/SC별 총계를 만든다.
+	print(@err_count);
+	// [한국어] 프로세스/스레드 단위 맵 — 1초 구간 카운터라 성능 맵과 같이 clear.
+	print(@proc_ops);
+	print(@proc_bytes);
+	print(@proc_rd);
+	print(@proc_wr);
+	print(@proc_bs);
+	print(@proc_q);
+	print(@proc_lat_sum);
+	print(@proc_lat_cnt);
+	print(@proc_seq);
+	print(@proc_rand);
+	print(@thr_ops);
+	printf("---TICK---\n");
+	clear(@op_count);
+	clear(@read_count);
+	clear(@write_count);
+	clear(@bytes_sum);
+	clear(@lat_sum);
+	clear(@lat_count);
+	clear(@lat_hist);
+	// [한국어] 에러 상세 인쇄 예산만 매 초 리셋 — @err_count(누적)는 유지.
+	clear(@err_budget);
+	clear(@proc_ops);
+	clear(@proc_bytes);
+	clear(@proc_rd);
+	clear(@proc_wr);
+	clear(@proc_bs);
+	clear(@proc_q);
+	clear(@proc_lat_sum);
+	clear(@proc_lat_cnt);
+	clear(@proc_seq);
+	clear(@proc_rand);
+	clear(@thr_ops);
+	// [한국어] @last_lba_end는 틱 경계를 넘어 이어져야 순차성 판정이 끊기지
+	// 않으므로 clear하지 않는다(프로세스당 1엔트리라 누적돼도 작다).
+}
+
+END
+{
+	clear(@start);
+	clear(@op_count);
+	clear(@read_count);
+	clear(@write_count);
+	clear(@bytes_sum);
+	clear(@lat_sum);
+	clear(@lat_count);
+	clear(@lat_hist);
+	clear(@to_ts);
+	clear(@to_opcode);
+	clear(@to_nsid);
+	clear(@to_flags);
+	clear(@to_cdw10);
+	clear(@to_cdw11);
+	clear(@to_cdw12);
+	clear(@to_cdw13);
+	clear(@to_cdw14);
+	clear(@to_cdw15);
+	clear(@err_count);
+	clear(@err_budget);
+	clear(@cmd_tgid);
+	clear(@proc_ops);
+	clear(@proc_bytes);
+	clear(@proc_rd);
+	clear(@proc_wr);
+	clear(@proc_bs);
+	clear(@proc_q);
+	clear(@proc_lat_sum);
+	clear(@proc_lat_cnt);
+	clear(@thr_ops);
+	clear(@proc_seq);
+	clear(@proc_rand);
+	clear(@last_lba_end);
+}

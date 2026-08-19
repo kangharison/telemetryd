@@ -1,0 +1,1684 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>telemetryd</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #161b22; --border: #2a313c; --text: #d6dde5;
+    --muted: #8b96a3; --accent: #59a6ff; --ok: #58c774; --warn: #e0b341; --err: #f0665a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.5 ui-monospace, "SF Mono", Consolas, monospace; }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; color: var(--accent); font-weight: 600; }
+  #device-buttons, #tab-buttons { display: flex; gap: 8px; }
+  .devbtn, .tabbtn { background: var(--panel); border: 1px solid var(--border); color: var(--text);
+            padding: 6px 14px; border-radius: 6px; cursor: pointer; font: inherit; }
+  .devbtn:hover, .tabbtn:hover { border-color: var(--accent); }
+  .devbtn.active, .tabbtn.active { border-color: var(--accent); background: #1b2a3d; color: var(--accent); }
+  #tab-buttons::before { content: "▸"; color: var(--muted); margin-right: -2px; }
+  main { padding: 12px; }
+  .tabcontent { display: flex; flex-direction: column; gap: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+           padding: 12px; overflow: auto; }
+  .panel h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+              color: var(--muted); display: flex; justify-content: space-between; align-items: center;
+              flex-wrap: wrap; gap: 6px; }
+  .panel h2 .h2-controls { display: flex; align-items: center; gap: 8px; text-transform: none;
+                            letter-spacing: normal; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1b222b; }
+  tbody tr.selected { background: #1b2a3d; }
+  tfoot tr.perf-agg-row { font-weight: 600; background: #1a2430; border-top: 2px solid var(--border); }
+  tfoot tr.perf-agg-row td:first-child { color: var(--accent); }
+  /* [한국어] 이벤트 목록 행 — 종류(kind)별로 색만 다르게 주고, 컬럼 구성 자체는
+     종류와 무관하게 공통이다(특정 종류가 목록을 대표하지 않게 하려는 것). */
+  tbody tr.event-row.kind-timeout { background: rgba(240, 102, 90, 0.10); }
+  tbody tr.event-row.kind-timeout:hover { background: rgba(240, 102, 90, 0.18); }
+  tbody tr.event-row.kind-error { background: rgba(224, 179, 65, 0.10); }
+  tbody tr.event-row.kind-error:hover { background: rgba(224, 179, 65, 0.18); }
+  .event-kind.error { background:#3a331c; color:var(--warn); }
+  .event-flag { display:inline-block; padding:0 6px; border-radius:4px; font-size:10px;
+                margin-left:6px; background:#3a1f1c; color:var(--err); }
+  #event-kinds-registry { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:6px; }
+  .kind-card { border:1px solid var(--border); border-radius:6px; padding:6px 10px;
+               background:#0b0e12; max-width:460px; }
+  .kind-card .kind-card-src { color:var(--muted); font-size:11px; }
+  .kind-card.inactive { opacity:.55; }
+  tbody tr.event-detail-row, tbody tr.event-detail-row:hover { background: #0b0e12; cursor: default; }
+  tbody tr.event-detail-row > td { white-space: normal; text-align: left; padding: 8px 12px; }
+  /* [한국어] 요약 컬럼은 문장이라 좌측 정렬 + 줄바꿈 허용(헤더도 같이 맞춰야
+     숫자 컬럼처럼 오른쪽에 붙어 보이지 않는다). */
+  #event-table th:last-child, td.event-summary { text-align: left; white-space: normal; }
+  #event-table th:nth-child(2), #event-table td:nth-child(2) { text-align: left; }
+  /* [한국어] 누적 표의 문자열 컬럼(타입/상태 코드)은 헤더도 값과 같이 좌측 정렬 */
+  #error-stats-table th:nth-child(2), #error-stats-table th:nth-child(4) { text-align: left; }
+  .event-kind { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;
+                background:#22303d; color:var(--accent); }
+  .event-kind.timeout { background:#3a1f1c; color:var(--err); }
+  .event-detail-table { width:auto; font-size:11px; }
+  .event-detail-table th { color:var(--muted); font-weight:500; text-align:left;
+                            padding:2px 14px 2px 0; border:none; white-space:nowrap; }
+  .event-detail-table td { text-align:left; padding:2px 14px 2px 0; border:none; white-space:nowrap; }
+  /* [한국어] 통합 토폴로지 트리 — PCIe 계층과 NVMe 계층을 색으로 구분하되
+     구조(들여쓰기/연결선)는 하나로 이어져 보이게 한다. */
+  #topo-tree { font-size: 12px; }
+  .topo-node { position: relative; }
+  .topo-children { margin-left: 18px; padding-left: 12px; border-left: 1px dashed var(--border); }
+  .topo-row { display: flex; align-items: baseline; gap: 8px; padding: 3px 6px;
+              border-radius: 5px; cursor: pointer; }
+  .topo-row:hover { background: #1b222b; }
+  .topo-row.selected { background: #1b2a3d; }
+  .topo-row.on-path { outline: 1px solid rgba(89,166,255,.35); }
+  .topo-toggle { width: 12px; display: inline-block; color: var(--muted); user-select: none; }
+  .topo-label { color: var(--text); }
+  .topo-sub { color: var(--muted); font-size: 11px; }
+  .topo-badge { display:inline-block; padding:0 6px; border-radius:4px; font-size:10px;
+                border:1px solid transparent; }
+  /* PCIe 계층(파랑 계열) */
+  .topo-badge.system { background:#20262e; color:var(--muted); }
+  .topo-badge.host_bridge, .topo-badge.pci_bridge, .topo-badge.pci_endpoint {
+      background:#16273a; color:var(--accent); border-color:#24405e; }
+  /* NVMe 계층(초록 계열) — 두 세계가 만나는 지점이 색으로 드러난다 */
+  .topo-badge.nvme_ctrl, .topo-badge.nvme_subsystem, .topo-badge.namespace,
+  .topo-badge.queue_group, .topo-badge.queue {
+      background:#122a1c; color:var(--ok); border-color:#1e4430; }
+  .topo-details { margin: 2px 0 6px 30px; padding: 6px 10px; background:#0b0e12;
+                  border:1px solid var(--border); border-radius:6px; }
+  .topo-details table { width:auto; }
+  .topo-details th { color:var(--muted); font-weight:500; text-align:left;
+                     padding:1px 14px 1px 0; border:none; white-space:nowrap; }
+  .topo-details td { text-align:left; padding:1px 14px 1px 0; border:none; white-space:nowrap; }
+  /* [한국어] 프로파일러 탭 — 대상 선택/세션/기대 대조 */
+  .chip { display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border-radius:12px;
+          background:#16273a; color:var(--accent); border:1px solid #24405e; font-size:11px; }
+  .chip button { background:none; border:none; color:var(--muted); cursor:pointer; font:inherit; padding:0; }
+  .chip button:hover { color:var(--err); }
+  #target-chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; min-height:22px; }
+  tr.proc-row.is-target { background:#12251c; }
+  tr.proc-row.not-selectable { color:var(--muted); }
+  .proc-cmdline { background:#0b0e12; border:1px solid var(--border); border-radius:6px;
+                  padding:6px 10px; margin:2px 0 6px; white-space:pre-wrap; word-break:break-all;
+                  font-size:11px; }
+  .sess-card { border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px;
+               background:#0b0e12; }
+  .sess-card.finished { opacity:.6; }
+  .sess-head { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .grp { margin:8px 0 0 14px; padding:6px 10px; border-left:2px solid var(--border); }
+  .verdict { padding:0 8px; border-radius:10px; font-size:10px; }
+  .verdict.ok { background:#12331f; color:var(--ok); }
+  .verdict.bad { background:#3a1f1c; color:var(--err); }
+  .verdict.unknown { background:#20262e; color:var(--muted); }
+  .cmp-table th { color:var(--muted); font-weight:500; text-align:left; padding:1px 12px 1px 0;
+                  border:none; white-space:nowrap; }
+  .cmp-table td { text-align:left; padding:1px 12px 1px 0; border:none; white-space:nowrap; }
+  .warn-box { border:1px solid #4a3520; background:#241c10; color:var(--warn); border-radius:6px;
+              padding:8px 10px; margin-bottom:8px; font-size:11px; }
+  select.small { background:#1e2733; border:1px solid var(--border); color:var(--text);
+                 padding:2px 6px; border-radius:4px; font:inherit; font-size:11px; }
+  .perf-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .perf-tile { background: #0b0e12; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .perf-tile-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .perf-tile-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .perf-tile-value { font-size: 18px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+  .perf-chart { display: block; width: 100%; height: 110px; }
+  .perf-tile-legend { display: flex; gap: 14px; margin-top: 4px; font-size: 11px; color: var(--muted); }
+  .perf-legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+  .badge.admin { background: #3a2f1b; color: var(--warn); }
+  .badge.io { background: #12331f; color: var(--ok); }
+  .pill { display:inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; background:#22303d; color:var(--accent); }
+  button.small { background: #1e2733; border: 1px solid var(--border); color: var(--text);
+                 padding: 2px 8px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 11px; }
+  button.small:hover { border-color: var(--accent); }
+  label.autolabel { color: var(--muted); font-size: 11px; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .hexdump { white-space: pre; font-size: 11px; overflow-x: auto; background:#0b0e12; padding:8px;
+             border-radius:6px; border:1px solid var(--border); max-height: 320px; overflow-y:auto; }
+  .muted { color: var(--muted); }
+  .err { color: var(--err); }
+  .warn { color: var(--warn); }
+  .tnode { margin: 1px 0; }
+  .tnode-header { padding: 3px 4px; border-radius: 4px; }
+  .tnode-header.expandable { cursor: pointer; }
+  .tnode-header.expandable:hover { background: #1b222b; }
+  .tnode-header .toggle { display: inline-block; width: 14px; color: var(--accent); }
+  .tnode-children { margin-left: 18px; border-left: 1px dotted var(--border); padding-left: 6px; }
+  .kind { color: var(--muted); }
+  input[type=number] { width: 70px; background:#0b0e12; color:var(--text); border:1px solid var(--border);
+                        border-radius:4px; padding:2px 6px; font:inherit; }
+  .status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .status-dot.on { background: var(--ok); } .status-dot.off { background: var(--err); } .status-dot.idle { background: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>telemetryd</h1>
+  <div id="device-buttons"></div>
+  <div id="tab-buttons" style="display:none">
+    <button class="tabbtn" id="tab-btn-queue">Queue 정보</button>
+    <button class="tabbtn" id="tab-btn-perf">성능(eBPF)</button>
+    <button class="tabbtn" id="tab-btn-event">이벤트</button>
+    <button class="tabbtn" id="tab-btn-topo">토폴로지</button>
+    <button class="tabbtn" id="tab-btn-prof">프로파일러</button>
+  </div>
+</header>
+
+<main>
+  <div id="tab-content-queue" class="tabcontent" style="display:none">
+    <section class="panel" id="snapshot-panel">
+      <h2>큐 스냅샷 (실시간, WebSocket) <span id="snapshot-meta" class="muted"></span>
+        <span class="h2-controls">
+          <span id="ws-status" class="muted"><span class="status-dot idle"></span>대기 중</span>
+          <button class="small" id="ws-refresh">↻ 새로고침</button>
+        </span>
+      </h2>
+      <table id="queue-table">
+        <thead><tr><th>qid</th><th>role</th><th>depth</th><th>sq_tail</th><th>cq_head</th>
+          <th>hctx</th><th>inflight(drv)</th><th>inflight(sched)</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="tree-panel">
+      <h2>포인터 트리 탐색 (비실시간) <span class="muted">max depth 10</span></h2>
+      <div style="margin-bottom:8px">
+        <button class="small" id="load-nvme-dev-btn">struct nvme_dev 보기</button>
+        <span class="muted">— 누르면 조회를 시작합니다. 이후 각 줄을 눌러 펼치고/접으세요.</span>
+      </div>
+      <div id="tree-root"></div>
+    </section>
+
+    <section class="panel" id="entries-panel">
+      <h2>SQ 엔트리 / CDW — sq_tail 도어벨 기준 최근 16개 (큐 클릭 시 조회)
+        <span class="h2-controls">
+          <label class="autolabel"><input type="checkbox" id="entries-auto" checked> 자동 새로고침(2초)</label>
+          <button class="small" id="entries-refresh">↻ 새로고침</button>
+        </span>
+      </h2>
+      <div id="entries-info" class="muted"></div>
+      <table id="entries-table">
+        <thead><tr><th>idx</th><th>cid</th><th>opcode</th><th>nsid</th><th>flags</th>
+          <th>cdw2</th><th>cdw3</th><th>cdw10</th><th>cdw11</th><th>cdw12</th><th>cdw13</th><th>cdw14</th><th>cdw15</th>
+          <th>prp1</th><th>prp2</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="cq-panel">
+      <h2>CQ 엔트리 — cq_head 도어벨 기준 최근 16개 (큐 클릭 시 조회, 위 자동 새로고침과 함께 갱신)</h2>
+      <div id="cq-info" class="muted"></div>
+      <table id="cq-table">
+        <thead><tr><th>idx</th><th>cid</th><th>sq_id</th><th>sq_head</th><th>phase</th>
+          <th>SCT</th><th>SC</th><th>status_raw</th><th>result</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="prp-panel" style="display:none">
+      <h2>PRP 페이로드 <span id="prp-meta" class="muted"></span>
+        <button class="small" id="prp-close">닫기</button></h2>
+      <div id="prp-body"></div>
+    </section>
+  </div>
+
+  <div id="tab-content-perf" class="tabcontent" style="display:none">
+    <section class="panel" id="perf-panel">
+      <h2>실시간 성능 (eBPF, WebSocket)
+        <span class="h2-controls">
+          <span id="perf-status" class="muted"></span>
+          <button class="small" id="perf-refresh">↻ 새로고침</button>
+        </span>
+      </h2>
+      <table id="perf-table">
+        <thead><tr><th>qid</th><th>IOPS</th><th>read/s</th><th>write/s</th>
+          <th>BW(MB/s)</th><th>avg(µs)</th><th>p50(µs)</th><th>p95(µs)</th>
+          <th>p99(µs)</th><th>p99.9(µs)</th></tr></thead>
+        <tbody></tbody>
+        <tfoot></tfoot>
+      </table>
+      <div class="muted" style="margin-top:6px">— 행을 누르면 아래에 작업 관리자 스타일 실시간 그래프가 뜹니다(최근 <span id="perf-hist-len"></span>틱, 이 탭을 보고 있는 동안만 누적).</div>
+    </section>
+
+    <section class="panel" id="perf-detail-panel" style="display:none">
+      <h2 id="perf-detail-title">Queue</h2>
+      <span class="h2-controls" style="display:flex; justify-content:flex-end; margin-bottom:6px">
+        <button class="small" id="perf-detail-close">닫기</button>
+      </span>
+      <div class="perf-detail-grid">
+        <div class="perf-tile">
+          <div class="perf-tile-header"><span class="perf-tile-title">IOPS (read/write)</span>
+            <span class="perf-tile-value" id="perf-chart-iops-value">-</span></div>
+          <canvas id="perf-chart-iops" class="perf-chart"></canvas>
+          <div class="perf-tile-legend">
+            <span><span class="perf-legend-dot" style="background:#59a6ff"></span>read</span>
+            <span><span class="perf-legend-dot" style="background:#e0b341"></span>write</span>
+          </div>
+        </div>
+        <div class="perf-tile">
+          <div class="perf-tile-header"><span class="perf-tile-title">대역폭</span>
+            <span class="perf-tile-value" id="perf-chart-bw-value">-</span></div>
+          <canvas id="perf-chart-bw" class="perf-chart"></canvas>
+        </div>
+        <div class="perf-tile">
+          <div class="perf-tile-header"><span class="perf-tile-title">레이턴시 (avg/p99)</span>
+            <span class="perf-tile-value" id="perf-chart-lat-value">-</span></div>
+          <canvas id="perf-chart-lat" class="perf-chart"></canvas>
+          <div class="perf-tile-legend">
+            <span><span class="perf-legend-dot" style="background:#59a6ff"></span>avg</span>
+            <span><span class="perf-legend-dot" style="background:#f0665a"></span>p99</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- [한국어] 이벤트 탭 — NVMe 드라이버에서 관측된 이벤트 목록. 이벤트는
+       타임아웃일 수도, 컨트롤러 리셋일 수도, 그 밖의 것일 수도 있으므로 목록
+       컬럼은 어떤 종류에도 해당하는 공통 항목(시간/종류/qid/요약)만 둔다.
+       종류별 필드(타임아웃의 tag/opcode/CDW 등)는 행을 펼쳤을 때 그 종류
+       전용 렌더러가 그린다 — 특정 종류를 목록의 대표로 삼지 않기 위함. -->
+  <div id="tab-content-event" class="tabcontent" style="display:none">
+    <section class="panel" id="event-panel">
+      <h2>NVMe 이벤트 (실시간, WebSocket)
+        <span class="h2-controls">
+          <label class="autolabel">종류
+            <select class="small" id="event-kind-filter"><option value="">전체</option></select>
+          </label>
+          <span id="event-status" class="muted"></span>
+          <button class="small" id="event-refresh">↻ 새로고침</button>
+        </span>
+      </h2>
+      <div class="muted" style="margin-bottom:6px">
+        — 행을 누르면 그 <b>종류에 맞는 상세</b>가 펼쳐집니다. 등록된 이벤트 종류:
+      </div>
+      <!-- [한국어] 등록된 종류 목록은 서버(/api/event-kinds)가 준다 — 화면에
+           종류 이름을 하드코딩하지 않아야 종류가 늘어도 문구가 안 어긋난다. -->
+      <div id="event-kinds-registry"></div>
+      <table id="event-table">
+        <thead><tr><th>시간</th><th>종류</th><th>qid</th><th>요약</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- [한국어] 에러 완료 누적 카운터 — 이벤트 "목록"과 성격이 다른 집계라
+         패널을 따로 둔다. 목록은 최근 200건 링버퍼이고 폭주 시 초당 인쇄
+         예산으로 샘플링되지만, 이 카운터는 전수라 건수가 정확하다. -->
+    <section class="panel" id="error-stats-panel">
+      <h2>에러 상태 누적 (SCT/SC 조합별)
+        <span class="h2-controls">
+          <span id="error-stats-status" class="muted"></span>
+        </span>
+      </h2>
+      <table id="error-stats-table">
+        <thead><tr><th>SCT</th><th>타입</th><th>SC</th><th>상태 코드</th><th>누적</th></tr></thead>
+        <tbody></tbody>
+        <tfoot></tfoot>
+      </table>
+    </section>
+  </div>
+
+  <!-- [한국어] 토폴로지 탭 — PCIe 계보와 NVMe 서브시스템 구조를 **하나의 트리**로
+       보여준다. 위쪽(파랑)은 PCI 호스트 브리지 → 브리지/스위치 → 엔드포인트,
+       아래쪽(초록)은 그 엔드포인트에 붙은 NVMe 컨트롤러 → 서브시스템/네임스페이스/큐.
+       두 계층이 컨트롤러 노드에서 만나는 게 이 화면의 핵심이다. -->
+  <div id="tab-content-topo" class="tabcontent" style="display:none">
+    <section class="panel" id="topo-panel">
+      <h2>PCIe 토폴로지 + NVMe 서브시스템 (통합 트리)
+        <span class="h2-controls">
+          <label class="autolabel"><input type="checkbox" id="topo-details-all"> 모든 속성 펼치기</label>
+          <span id="topo-status" class="muted"></span>
+          <button class="small" id="topo-refresh">↻ 새로고침</button>
+        </span>
+      </h2>
+      <div class="muted" style="margin-bottom:8px">
+        <span class="topo-badge pci_endpoint">PCIe 계층</span>
+        <span class="topo-badge nvme_ctrl">NVMe 계층</span>
+        — 노드를 누르면 속성(BDF/클래스/nsid/용량/큐 정보)이 펼쳐집니다.
+        선택한 디바이스의 경로는 자동으로 펼쳐져 강조됩니다.
+      </div>
+      <div id="topo-tree"></div>
+    </section>
+  </div>
+
+  <!-- [한국어] 프로파일러 탭 — NVMe I/O를 내는 **임의의 프로세스**를 런타임에
+       골라 관측한다. 특정 애플리케이션 전용 화면이 아니라, 대상 선택 → 세션 →
+       논리 그룹(job/시나리오) → 기대 vs 실측 대조의 순서로 일반화돼 있다. -->
+  <div id="tab-content-prof" class="tabcontent" style="display:none">
+    <section class="panel" id="target-select-panel">
+      <h2>대상 프로세스 선택
+        <span class="h2-controls">
+          <label class="autolabel"><input type="checkbox" id="proc-only-io" checked>
+            NVMe I/O 발행 중인 프로세스만</label>
+          <span id="proc-status" class="muted"></span>
+          <button class="small" id="proc-refresh">↻ 새로고침</button>
+        </span>
+      </h2>
+      <div id="target-chips"></div>
+      <div class="muted" style="margin-bottom:6px">
+        — [+]로 대상을 추가하면 즉시 관측이 시작됩니다(데몬 재시작 불필요). 이름/패턴 규칙은
+        프로세스가 죽어도 남아 다음 실행 때 자동으로 다시 붙습니다.
+      </div>
+      <table id="proc-table">
+        <thead><tr><th>PID</th><th>NAME</th><th>THREADS</th><th>IO RATE</th>
+          <th>DEVICE</th><th>대상</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:8px; display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+        <select class="small" id="rule-kind">
+          <option value="name">name</option>
+          <option value="pid">pid</option>
+          <option value="name_pattern">name_pattern</option>
+          <option value="cmdline_pattern">cmdline_pattern</option>
+        </select>
+        <input class="small" id="rule-value" placeholder="예: fio 또는 .*--rw=randwrite.*"
+               style="background:#1e2733;border:1px solid var(--border);color:var(--text);
+                      padding:2px 6px;border-radius:4px;font:inherit;font-size:11px;min-width:280px">
+        <button class="small" id="rule-add">규칙 추가</button>
+        <span class="muted">— 아직 실행되지 않은 프로세스도 규칙으로 미리 걸어둘 수 있습니다.</span>
+      </div>
+    </section>
+
+    <section class="panel" id="profile-panel">
+      <h2>관측 세션 (실시간)
+        <span class="h2-controls">
+          <span id="profile-status" class="muted"></span>
+        </span>
+      </h2>
+      <div id="profile-warnings"></div>
+      <div id="profile-sessions"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+// [한국어] activeTab: null(아직 아무 탭도 안 눌렀음) | 'queue' | 'perf' | 'event'.
+// 디바이스를 고르는 것만으로는 아무 패널도 켜지 않는다 — 탭을 눌러야 그
+// 탭에 필요한 WebSocket/폴링이 시작된다("처음부터 보여주지 말고" 요구사항).
+// eventExpanded: 이벤트 목록에서 펼쳐 둔 행의 키 집합 — 이벤트 WS가 1초마다
+// 목록 전체를 다시 보내므로, 이걸 안 들고 있으면 사용자가 펼쳐 본 상세가
+// 매 초 접혀버린다.
+const state = { device: null, qid: null, activeTab: null, perfHistory: {}, perfSelectedQid: null,
+                eventExpanded: new Set(), eventKindFilter: '' };
+const PERF_HISTORY_LEN = 60;   // eBPF 틱이 1초 간격이라 대략 최근 1분치(작업 관리자 그래프 흉내)
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`); }
+  return r.json();
+}
+
+async function loadDevices() {
+  const names = await getJSON('/api/devices');
+  const box = document.getElementById('device-buttons');
+  box.innerHTML = '';
+  names.forEach(name => {
+    const b = document.createElement('button');
+    b.className = 'devbtn'; b.textContent = name;
+    b.onclick = () => selectDevice(name, b);
+    box.appendChild(b);
+  });
+  if (names.length) selectDevice(names[0], box.firstChild);
+}
+
+function selectDevice(name, btnEl) {
+  state.device = name; state.qid = null;
+  document.querySelectorAll('.devbtn').forEach(b => b.classList.remove('active'));
+  if (btnEl) btnEl.classList.add('active');
+  document.getElementById('entries-table').querySelector('tbody').innerHTML = '';
+  document.getElementById('entries-info').textContent = '';
+  document.getElementById('cq-table').querySelector('tbody').innerHTML = '';
+  document.getElementById('cq-info').textContent = '';
+  document.getElementById('prp-panel').style.display = 'none';
+  document.getElementById('tree-root').innerHTML = '';
+  document.getElementById('perf-table').querySelector('tbody').innerHTML = '';
+  document.getElementById('event-table').querySelector('tbody').innerHTML = '';
+  document.getElementById('event-status').textContent = '';
+  // [한국어] 이벤트는 디바이스별로 따로 조회되므로 펼침 상태/종류 필터 후보도
+  // 디바이스를 바꾸면 의미가 없어진다 — 같이 초기화한다.
+  state.eventExpanded.clear();
+  lastEventSig = null;
+  document.querySelector('#error-stats-table tbody').innerHTML = '';
+  document.querySelector('#error-stats-table tfoot').innerHTML = '';
+  document.getElementById('error-stats-status').textContent = '';
+  resetEventKindFilter();
+  // [한국어] 디바이스를 바꾸면 이전 디바이스 큐들의 누적 이력은 의미가 없어져
+  // 히스토리와 선택된 그래프를 같이 초기화한다.
+  state.perfHistory = {};
+  state.perfSelectedQid = null;
+  document.getElementById('perf-detail-panel').style.display = 'none';
+  stopEntriesAutoRefresh();
+  document.getElementById('tab-buttons').style.display = 'flex';
+  // [한국어] 이미 열려있던 탭이 있으면 새 디바이스로 그 탭만 재연결하고,
+  // 없던 탭(아직 아무것도 안 열림/다른 탭)은 계속 대기 상태로 둔다.
+  if (state.activeTab === 'queue') connectWS(name); else stopWS('대기 중 — Queue 정보 탭을 클릭하세요');
+  if (state.activeTab === 'perf') connectPerfWS(name); else stopPerfWS('대기 중 — 성능 탭을 클릭하세요');
+  if (state.activeTab === 'event') { connectEventsWS(name); startErrorStatsPolling(); }
+  else { stopEventsWS('대기 중 — 이벤트 탭을 클릭하세요'); stopErrorStatsPolling(); }
+  // [한국어] 토폴로지 트리 자체는 시스템 전체라 디바이스를 바꿔도 다시 받을
+  // 필요가 없다 — 선택 강조/자동 펼침만 새 디바이스 기준으로 다시 그린다.
+  if (topoData) renderTopology();
+}
+
+// [한국어] 탭 정의 테이블 — 탭이 3개로 늘면서 if/else 분기로는 "안 보이는
+// 탭의 연결을 빠짐없이 끊는" 걸 보장하기 어려워져, 탭 목록을 데이터로 두고
+// 루프로 처리한다. 탭을 더 추가할 때도 이 배열에 한 줄만 넣으면 된다.
+const TABS = [
+  { id: 'queue', btn: 'tab-btn-queue', content: 'tab-content-queue', idle: '대기 중 — Queue 정보 탭을 클릭하세요' },
+  { id: 'perf',  btn: 'tab-btn-perf',  content: 'tab-content-perf',  idle: '대기 중 — 성능 탭을 클릭하세요' },
+  { id: 'event', btn: 'tab-btn-event', content: 'tab-content-event', idle: '대기 중 — 이벤트 탭을 클릭하세요' },
+  { id: 'topo',  btn: 'tab-btn-topo',  content: 'tab-content-topo',  idle: '대기 중 — 토폴로지 탭을 클릭하세요' },
+  { id: 'prof',  btn: 'tab-btn-prof',  content: 'tab-content-prof',  idle: '대기 중 — 프로파일러 탭을 클릭하세요' },
+];
+TABS.forEach(t => { document.getElementById(t.btn).onclick = () => switchTab(t.id); });
+
+function switchTab(tab) {
+  if (state.activeTab === tab) return;
+  state.activeTab = tab;
+  TABS.forEach(t => {
+    document.getElementById(t.btn).classList.toggle('active', tab === t.id);
+    document.getElementById(t.content).style.display = tab === t.id ? '' : 'none';
+  });
+  // [한국어] 안 보이는 탭의 연결은 모두 끊어 자원을 아낀다(§9.8) — drgn/QMP
+  // 백엔드는 조회 1건이 수 초라 안 보는 탭의 스트림을 켜 두면 보고 있는 탭의
+  // 응답까지 같이 밀린다(실측된 문제).
+  const idle = id => (TABS.find(t => t.id === id) || {}).idle || '';
+  if (tab !== 'queue') { stopWS(idle('queue')); stopEntriesAutoRefresh(); }
+  if (tab !== 'perf') stopPerfWS(idle('perf'));
+  if (tab !== 'event') { stopEventsWS(idle('event')); stopErrorStatsPolling(); }
+  if (tab !== 'prof') { stopProfileWS(); stopProcPolling(); }
+  if (tab === 'queue') {
+    if (state.device) connectWS(state.device);
+    startEntriesAutoRefresh();
+  } else if (tab === 'perf') {
+    if (state.device) connectPerfWS(state.device);
+  } else if (tab === 'event') {
+    loadEventKinds();
+    if (state.device) { connectEventsWS(state.device); startErrorStatsPolling(); }
+  } else if (tab === 'prof') {
+    // [한국어] 프로세스 목록은 탭을 열 때 한 번만 조회하고, 이후 갱신은
+    // 새로고침 버튼으로 명시한다(토폴로지 탭과 같은 방침) — 주기 폴링을
+    // 하지 않는 이유는 stopProcPolling() 위의 주석 참고. 세션 지표는
+    // 저렴한 경로라 WS로 계속 실시간.
+    refreshProcesses();
+    connectProfileWS();
+  } else if (tab === 'topo') {
+    // [한국어] 토폴로지는 실시간 스트림이 아니다 — 장치 구성은 거의 안 바뀌고
+    // drgn 조회가 비싸서(디바이스마다 커널 구조체 여러 번 읽기, 수 초) 탭을
+    // 열 때 한 번만 받고 캐시한다. 갱신은 새로고침 버튼으로 명시적으로.
+    loadTopology();
+  }
+}
+
+let ws = null;
+let wsGen = 0;   // [한국어] perfWsGen과 같은 패턴 — 오래된 소켓의 onclose가 새 연결을 안 건드리게.
+function connectWS(device) {
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  const myGen = ++wsGen;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/ws/devices/${device}/metrics?interval=0.5`);
+  ws = sock;
+  const dot = document.querySelector('#ws-status .status-dot');
+  const label = document.getElementById('ws-status');
+  sock.onopen = () => {
+    if (myGen !== wsGen) return;
+    dot.className = 'status-dot on'; label.lastChild.textContent = ' connected: ' + device;
+  };
+  sock.onclose = () => {
+    if (myGen !== wsGen) return;  // 이미 다른 연결로 교체됨(탭 전환/디바이스 전환 포함) — 무시
+    dot.className = 'status-dot off';
+    label.lastChild.textContent = ' disconnected — 3초 뒤 자동 재연결(또는 새로고침 버튼)';
+    setTimeout(() => { if (myGen === wsGen && state.device === device && state.activeTab === 'queue') connectWS(device); }, 3000);
+  };
+  sock.onerror = () => { if (myGen === wsGen) dot.className = 'status-dot off'; };
+  sock.onmessage = (ev) => renderSnapshot(JSON.parse(ev.data));
+}
+
+// [한국어] 탭 전환/디바이스 전환처럼 "의도적으로" 끊을 때 쓴다 — onclose의
+// 자동재연결 타이머가 이걸 에러로 오인해 되살리지 않도록 wsGen을 먼저 올린다.
+function stopWS(idleText) {
+  wsGen++;
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  const dot = document.querySelector('#ws-status .status-dot');
+  const label = document.getElementById('ws-status');
+  if (dot) dot.className = 'status-dot idle';
+  if (label) label.lastChild.textContent = ' ' + idleText;
+}
+
+document.getElementById('ws-refresh').onclick = () => {
+  if (state.device) connectWS(state.device);
+};
+
+let perfWs = null;
+let perfWsGen = 0;   // [한국어] 세대 번호 — 오래된 소켓의 onclose가 새 연결을 덮어쓰지 않게.
+function connectPerfWS(device) {
+  if (perfWs) { perfWs.onclose = null; perfWs.close(); perfWs = null; }
+  const myGen = ++perfWsGen;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/ws/devices/${device}/performance?interval=1`);
+  perfWs = sock;
+  document.getElementById('perf-status').textContent = ' 연결 중...';
+  sock.onopen = () => { if (myGen === perfWsGen) document.getElementById('perf-status').textContent = ''; };
+  sock.onmessage = (ev) => renderPerf(JSON.parse(ev.data));
+  sock.onclose = () => {
+    if (myGen !== perfWsGen) return;  // 이미 다른 연결로 교체됨(탭 전환/디바이스 전환/수동 새로고침) — 무시
+    document.getElementById('perf-status').textContent = ' (연결 끊김 — 3초 뒤 자동 재연결, 또는 새로고침 버튼)';
+    setTimeout(() => { if (myGen === perfWsGen && state.device === device && state.activeTab === 'perf') connectPerfWS(device); }, 3000);
+  };
+}
+
+function stopPerfWS(idleText) {
+  perfWsGen++;
+  if (perfWs) { perfWs.onclose = null; perfWs.close(); perfWs = null; }
+  const el = document.getElementById('perf-status');
+  if (el) el.textContent = ' ' + idleText;
+}
+
+// ===========================================================================
+// [한국어] 이벤트 탭 — 종류(kind)를 가리지 않는 이벤트 목록.
+//
+// 이벤트는 타임아웃일 수도 있고 컨트롤러 리셋일 수도 있어서, 목록의 컬럼은
+// 어떤 종류에도 해당하는 공통 항목(시간/종류/qid/요약)만 둔다. 종류별 필드는
+// 아래 EVENT_DETAIL_RENDERERS의 종류 전용 렌더러가 행을 펼쳤을 때만 그린다 —
+// 특정 종류(지금은 timeout)의 필드를 목록 컬럼으로 고정해버리면 다른 종류가
+// 들어오는 순간 빈 칸 투성이가 되거나 목록을 다시 갈아엎어야 한다.
+//
+// 서버(GetEvents/StreamEvents)는 각 이벤트를 "공통 필드 + kind에 해당하는
+// 상세 키 하나"(proto의 oneof)로 보낸다. 그래서 모르는 kind가 와도 이 코드는
+// 안 깨진다 — 렌더러가 없으면 상세 없이 공통 요약 한 줄만 그린다.
+// ===========================================================================
+const EVENT_KIND_LABELS = { timeout: '타임아웃', error: '에러 완료' };  // 표시용 라벨(없으면 kind 원문)
+
+function escHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// [한국어] kind == 'timeout' 전용 상세 렌더러 — nvme_timeout 로그에만 있는
+// 필드(제출 시점에 캐시해 둔 CDW 포함)를 그 종류에 맞게 포매팅한다.
+// DESIGN.md §9.11: 여기 값들은 "타임아웃난 커맨드가 제출될 때 가졌던 값"이다.
+function renderTimeoutDetail(e) {
+  const d = e.timeout || {};
+  const hex32 = v => '0x' + ((Number(v) || 0) >>> 0).toString(16).padStart(8, '0');
+  const hex8 = v => '0x' + ((Number(v) || 0) >>> 0).toString(16).padStart(2, '0');
+  const us = Number(d.elapsed_us) || 0;
+  const elapsed = us >= 1e6 ? `${(us / 1e6).toFixed(1)} s` : `${(us / 1000).toFixed(1)} ms`;
+  const cdws = [10, 11, 12, 13, 14, 15]
+    .map(n => `<th>cdw${n}</th><td>${hex32(d['cdw' + n])}</td>`).join('');
+  return `
+    <table class="event-detail-table">
+      <tr>
+        <th>tag</th><td>${escHtml(d.tag)}</td>
+        <th>opcode</th><td>${escHtml(d.opcode_name)} <span class="pill">${hex8(d.opcode)}</span></td>
+        <th>nsid</th><td>${escHtml(d.nsid)}</td>
+        <th>flags</th><td>${hex8(d.flags)}</td>
+        <th>제출~타임아웃</th><td>${elapsed}</td>
+      </tr>
+      <tr>${cdws}</tr>
+    </table>
+    <div class="muted" style="margin-top:6px">
+      kprobe:nvme_timeout — CDW는 nvme_setup_cmd(제출) 시점에 캐시해 둔 값입니다.
+    </div>`;
+}
+
+// [한국어] kind == 'error' 전용 상세 렌더러 — 에러 status로 반환된 커맨드.
+// status를 SCT/SC로 분해해 보여주고, 실무 판단에 직결되는 DNR(재시도 불가)/
+// More(에러 로그 페이지에 추가 정보)/CRD(재시도 지연)를 배지로 강조한다.
+// SLBA/NLB는 read/write일 때만 의미가 있어(lba_valid) 그때만 표시한다 —
+// 다른 opcode에서는 같은 CDW 자리가 전혀 다른 필드라 보여주면 오독을 부른다.
+// [한국어] NSID 0xFFFFFFFF는 "모든 네임스페이스"(broadcast)를 뜻하는 정상 값이라
+// 4294967295로 그대로 보여주면 오히려 이상해 보인다 — admin 커맨드에서 흔하다.
+function nsidText(nsid) {
+  const n = Number(nsid) || 0;
+  return n === 0xFFFFFFFF ? '0xFFFFFFFF <span class="muted">(broadcast)</span>' : escHtml(n);
+}
+
+function renderErrorDetail(e) {
+  const d = e.error || {};
+  const hex = (v, n) => '0x' + ((Number(v) || 0) >>> 0).toString(16).padStart(n, '0');
+  const us = Number(d.elapsed_us) || 0;
+  const flags = [];
+  if (d.dnr) flags.push('DNR — 재시도 불가');
+  if (d.more) flags.push('More — 에러 로그 페이지에 추가 정보');
+  if (Number(d.crd)) flags.push('CRD=' + escHtml(d.crd));
+  const lba = d.lba_valid
+    ? `<th>SLBA</th><td>${escHtml(d.slba)}</td><th>NLB</th><td>${escHtml(d.nlb)} 블록</td>`
+    : `<th>LBA</th><td class="muted">${d.submit_cached ? 'read/write가 아니라 해당 없음' : '제출 시점을 못 봐 미상'}</td>`;
+  return `
+    <table class="event-detail-table">
+      <tr>
+        <th>status</th><td>${hex(d.status, 4)}</td>
+        <th>SCT</th><td>${escHtml(d.sct)} (${escHtml(d.sct_name)})</td>
+        <th>SC</th><td>${hex(d.sc, 2)} (${escHtml(d.sc_name)})</td>
+        <th>재시도</th><td>${escHtml(d.retries)}회</td>
+      </tr>
+      <tr>
+        <th>cid</th><td>${escHtml(d.cid)}</td>
+        <th>tag</th><td>${escHtml(d.tag)}</td>
+        <th>opcode</th><td>${escHtml(d.opcode_name)} <span class="pill">${hex(d.opcode, 2)}</span></td>
+        <th>nsid</th><td>${nsidText(d.nsid)}</td>
+      </tr>
+      <tr>${lba}<th>제출~완료</th><td>${us >= 1e6 ? (us / 1e6).toFixed(1) + ' s' : (us / 1000).toFixed(1) + ' ms'}</td></tr>
+    </table>
+    ${flags.map(f => `<span class="event-flag">${escHtml(f)}</span>`).join(' ')}
+    <div class="muted" style="margin-top:6px">
+      tracepoint:nvme:nvme_complete_rq (status != 0) — status는 phase 비트가 제거된 값입니다.
+    </div>`;
+}
+
+//: kind -> 종류별 상세 렌더러. 여기 없는 kind는 요약 한 줄만 그린다.
+const EVENT_DETAIL_RENDERERS = { timeout: renderTimeoutDetail, error: renderErrorDetail };
+
+// [한국어] 이벤트 1건을 다시 그려도 같은 행으로 인식하기 위한 키. 서버가 매
+// 틱마다 목록 전체를 다시 보내므로(StreamEvents의 설계 — 클라이언트가 델타를
+// 추적 안 해도 되게), 키가 있어야 펼쳐 둔 상세가 매 초 접히지 않는다.
+// observed_at은 그 줄을 로그에서 처음 읽은 시각이라 재전송돼도 안 바뀐다.
+function eventKey(e) {
+  // [한국어] 같은 초에 같은 큐에서 여러 건이 날 수 있어 종류별 식별자까지 넣는다.
+  const id = e.timeout ? 't' + e.timeout.tag : (e.error ? 'c' + e.error.cid + '/' + e.error.status : '');
+  return `${e.kind}|${e.observed_at}|${e.qid}|${id}`;
+}
+
+let lastEventSig = null;   // [한국어] 목록이 그대로면 DOM을 다시 안 그리기 위한 서명
+
+// [한국어] 종류 필터 select — 실제로 관측된 kind만 후보로 채운다(서버가 어떤
+// 종류를 보내는지 프론트가 미리 알 필요 없게).
+function resetEventKindFilter() {
+  const sel = document.getElementById('event-kind-filter');
+  if (!sel) return;
+  state.eventKindFilter = '';
+  sel.innerHTML = '<option value="">전체</option>';
+}
+
+function syncEventKindOptions(kinds) {
+  const sel = document.getElementById('event-kind-filter');
+  const have = new Set([...sel.options].map(o => o.value));
+  kinds.forEach(k => {
+    if (have.has(k)) return;
+    const o = document.createElement('option');
+    o.value = k; o.textContent = EVENT_KIND_LABELS[k] ? `${EVENT_KIND_LABELS[k]}(${k})` : k;
+    sel.appendChild(o);
+  });
+}
+
+function renderEvents(reply) {
+  const tbody = document.querySelector('#event-table tbody');
+  const statusEl = document.getElementById('event-status');
+  const all = reply.events || [];
+  syncEventKindOptions([...new Set(all.map(e => e.kind))]);
+  const events = state.eventKindFilter ? all.filter(e => e.kind === state.eventKindFilter) : all;
+
+  const counts = {};
+  all.forEach(e => { counts[e.kind] = (counts[e.kind] || 0) + 1; });
+  const countText = Object.keys(counts).length
+    ? Object.entries(counts).map(([k, n]) => `${k} ${n}건`).join(', ')
+    : '이벤트 없음';
+  statusEl.textContent = '  ' + countText;
+
+  // [한국어] 서버는 발생한 순서(오래된->최신)로 보내므로, 다른 목록들과 같은
+  // 관례(최근 것을 위로)를 맞추려 뒤집어서 그린다.
+  const rows = [...events].reverse();
+  const sig = rows.map(eventKey).join(',') + '#' + [...state.eventExpanded].sort().join(',');
+  if (sig === lastEventSig) return;   // 내용/펼침 상태 둘 다 그대로면 DOM 유지(깜빡임·선택 해제 방지)
+  lastEventSig = sig;
+
+  tbody.innerHTML = '';
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="4" class="muted event-summary">이벤트 없음 — 이 디바이스에서 아직 관측된 NVMe 이벤트가 없습니다.</td>`;
+    tr.style.cursor = 'default';
+    tbody.appendChild(tr);
+    return;
+  }
+  rows.forEach(e => {
+    const key = eventKey(e);
+    const expanded = state.eventExpanded.has(key);
+    const renderer = EVENT_DETAIL_RENDERERS[e.kind];
+    const t = new Date((Number(e.observed_at) || 0) * 1000).toLocaleTimeString();
+    const label = EVENT_KIND_LABELS[e.kind] || e.kind;
+
+    const tr = document.createElement('tr');
+    tr.className = 'event-row kind-' + escHtml(e.kind);
+    tr.innerHTML = `<td>${escHtml(t)}</td>
+      <td><span class="event-kind ${escHtml(e.kind)}">${escHtml(label)}</span></td>
+      <td>${escHtml(e.qid)}</td>
+      <td class="event-summary">${renderer ? (expanded ? '▾ ' : '▸ ') : ''}${escHtml(e.summary)}</td>`;
+    if (renderer) {
+      tr.onclick = () => {
+        if (state.eventExpanded.has(key)) state.eventExpanded.delete(key);
+        else state.eventExpanded.add(key);
+        lastEventSig = null;          // 강제 재그리기
+        renderEvents(reply);
+      };
+    } else {
+      tr.style.cursor = 'default';   // 상세 렌더러가 없는(=모르는) 종류는 펼칠 게 없음
+    }
+    tbody.appendChild(tr);
+
+    if (renderer && expanded) {
+      const dtr = document.createElement('tr');
+      dtr.className = 'event-detail-row';
+      dtr.innerHTML = `<td colspan="4">${renderer(e)}</td>`;
+      tbody.appendChild(dtr);
+    }
+  });
+}
+
+// [한국어] 등록된 이벤트 종류 목록 — 서버(/api/event-kinds)가 알려준다.
+// 화면에 종류를 하드코딩하지 않으므로, 종류가 늘거나 수집기가 꺼져 있을 때
+// (active=false) 그 사실이 그대로 드러난다. 한 번만 받아 캐시한다.
+let eventKindsLoaded = false;
+async function loadEventKinds() {
+  if (eventKindsLoaded) return;
+  const box = document.getElementById('event-kinds-registry');
+  try {
+    const reply = await getJSON('/api/event-kinds');
+    box.innerHTML = '';
+    (reply.kinds || []).forEach(k => {
+      const div = document.createElement('div');
+      div.className = 'kind-card' + (k.active ? '' : ' inactive');
+      div.innerHTML = `<span class="event-kind ${escHtml(k.kind)}">${escHtml(k.label)}</span>
+        <span class="muted">${k.active ? '수집 중' : '미수집'}</span>
+        <div class="kind-card-src">${escHtml(k.source)}</div>
+        <div class="muted" style="font-size:11px">${escHtml(k.description)}</div>`;
+      box.appendChild(div);
+    });
+    eventKindsLoaded = true;
+  } catch (err) {
+    box.textContent = '등록된 종류 조회 실패: ' + err;
+  }
+}
+
+// [한국어] 에러 누적 카운터 — WebSocket 푸시가 없는(스트림으로 만들 만큼 자주
+// 바뀌지 않는) 집계라 REST를 주기적으로 다시 부른다. SQ/CQ 엔트리와 같은
+// "이전 조회가 끝난 뒤에만 다음 걸 예약"하는 재귀 setTimeout 방식이라 응답이
+// 느려도 요청이 쌓이지 않는다.
+let errorStatsTimerId = null;
+async function refreshErrorStats() {
+  if (!state.device) return;
+  const tbody = document.querySelector('#error-stats-table tbody');
+  const tfoot = document.querySelector('#error-stats-table tfoot');
+  const statusEl = document.getElementById('error-stats-status');
+  try {
+    const st = await getJSON(`/api/devices/${state.device}/error-stats`);
+    const counts = st.counts || [];
+    tbody.innerHTML = '';
+    tfoot.innerHTML = '';
+    if (!st.available) {
+      statusEl.textContent = '  ' + (st.error || '수집기 없음');
+      return;
+    }
+    statusEl.textContent = counts.length ? `  총 ${st.total}건 (수집기 시작 이후 누적)` : '  에러 0건 (수집 중)';
+    if (!counts.length) {
+      tbody.innerHTML = '<tr style="cursor:default"><td colspan="5" class="muted event-summary">에러 status로 반환된 커맨드가 아직 없습니다.</td></tr>';
+      return;
+    }
+    counts.forEach(c => {
+      const tr = document.createElement('tr');
+      tr.style.cursor = 'default';
+      tr.innerHTML = `<td>${escHtml(c.sct)}</td><td class="event-summary">${escHtml(c.sct_name)}</td>
+        <td>0x${(Number(c.sc) || 0).toString(16).padStart(2, '0')}</td>
+        <td class="event-summary">${escHtml(c.sc_name)}</td><td>${escHtml(c.count)}</td>`;
+      tbody.appendChild(tr);
+    });
+    tfoot.innerHTML = `<tr class="perf-agg-row"><td>합계</td><td></td><td></td><td></td><td>${escHtml(st.total)}</td></tr>`;
+  } catch (err) {
+    statusEl.textContent = '  조회 실패: ' + err;
+  }
+}
+
+function startErrorStatsPolling() {
+  stopErrorStatsPolling();
+  const tick = async () => {
+    if (state.activeTab !== 'event' || !state.device) return;
+    await refreshErrorStats();
+    if (state.activeTab === 'event') errorStatsTimerId = setTimeout(tick, 3000);
+  };
+  tick();
+}
+
+function stopErrorStatsPolling() {
+  if (errorStatsTimerId) { clearTimeout(errorStatsTimerId); errorStatsTimerId = null; }
+}
+
+// ===========================================================================
+// [한국어] 프로파일러 탭 — NVMe I/O를 내는 임의의 프로세스를 런타임에 선택해
+// 관측한다. 화면 어디에도 특정 애플리케이션 이름이 하드코딩돼 있지 않다:
+// 프로세스 목록/세션/논리 그룹/기대 대조는 모두 서버가 주는 데이터를 그릴 뿐이고,
+// 애플리케이션별 의미 부여는 서버 쪽 어댑터가 한다.
+// ===========================================================================
+function fmtRate(v) {
+  v = Number(v) || 0;
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M/s';
+  if (v >= 1e3) return (v / 1e3).toFixed(2) + 'K/s';
+  return v.toFixed(0) + '/s';
+}
+function fmtBytes(v) {
+  v = Number(v) || 0;
+  if (v >= 1 << 20) return (v / (1 << 20)).toFixed(0) + 'M';
+  if (v >= 1 << 10) return (v / (1 << 10)).toFixed(0) + 'K';
+  return v + 'B';
+}
+
+let procTimerId = null;
+let profileWs = null;
+let profileWsGen = 0;
+const procExpanded = new Set();      // cmdline을 펼쳐 둔 PID (길어서 기본은 접어둠)
+
+let procRefreshInFlight = false;
+
+async function refreshProcesses() {
+  // [한국어] 이 조회는 수십 초가 걸릴 수 있어서(위 stopProcPolling 주석) 두
+  // 가지가 필요하다: (1) 진행 중임을 화면에 알려 "먹통"으로 안 보이게,
+  // (2) 중복 실행 차단 — 사용자가 새로고침을 연타하면 그만큼 executor에
+  // 쌓여 앱 전체가 느려진다.
+  if (procRefreshInFlight) return;
+  procRefreshInFlight = true;
+  const onlyIo = document.getElementById('proc-only-io').checked;
+  const statusEl = document.getElementById('proc-status');
+  const btn = document.getElementById('proc-refresh');
+  statusEl.textContent = '  조회 중... (프로세스별 cmdline을 커널에서 읽어와 수십 초 걸릴 수 있음)';
+  if (btn) btn.disabled = true;
+  try {
+    const [list, targets] = await Promise.all([
+      getJSON('/api/processes?only_io=' + (onlyIo ? 'true' : 'false')),
+      getJSON('/api/targets'),
+    ]);
+    renderTargetChips(targets.rules || []);
+    renderProcesses(list.processes || []);
+    statusEl.textContent = `  ${(list.processes || []).length}개`;
+  } catch (err) {
+    statusEl.textContent = '  조회 실패: ' + err;
+  } finally {
+    procRefreshInFlight = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderTargetChips(rules) {
+  const box = document.getElementById('target-chips');
+  box.innerHTML = '';
+  if (!rules.length) {
+    box.innerHTML = '<span class="muted">선택된 대상 없음 — 아래 표에서 [+]를 누르거나 규칙을 추가하세요</span>';
+    return;
+  }
+  rules.forEach(r => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.innerHTML = `<span>${escHtml(r.kind)}=${escHtml(r.value)}</span>`;
+    const btn = document.createElement('button');
+    btn.textContent = '✕';
+    btn.title = '이 규칙 제거';
+    btn.onclick = () => removeTarget(r.kind, r.value);
+    chip.appendChild(btn);
+    box.appendChild(chip);
+  });
+}
+
+function renderProcesses(list) {
+  const tbody = document.querySelector('#proc-table tbody');
+  tbody.innerHTML = '';
+  if (!list.length) {
+    tbody.innerHTML = '<tr style="cursor:default"><td colspan="6" class="muted event-summary">'
+      + '조건에 맞는 프로세스가 없습니다(체크를 풀면 전체 목록).</td></tr>';
+    return;
+  }
+  list.forEach(e => {
+    const i = e.info || {};
+    const tr = document.createElement('tr');
+    tr.className = 'proc-row' + (e.is_target ? ' is-target' : '') + (e.selectable ? '' : ' not-selectable');
+    const add = e.selectable
+      ? (e.is_target ? '<span class="muted">관측 중</span>'
+                     : `<button class="small" data-pid="${i.pid}">+</button>`)
+      : `<span class="muted" title="${escHtml(e.unselectable_reason || '')}">선택 불가</span>`;
+    tr.innerHTML = `<td>${escHtml(i.pid)}</td>
+      <td class="event-summary">${escHtml(i.comm)}</td>
+      <td>${escHtml(i.thread_count)}</td>
+      <td>${fmtRate(e.io_rate)}</td>
+      <td>${escHtml((e.target_devices || []).join(',') || '-')}</td>
+      <td>${add}</td>`;
+    tr.onclick = (ev) => {
+      if (ev.target.tagName === 'BUTTON') return;
+      // [한국어] cmdline은 길어서 기본은 접어두고, 행을 누르면 펼친다(명세 1-3).
+      if (procExpanded.has(i.pid)) procExpanded.delete(i.pid); else procExpanded.add(i.pid);
+      renderProcesses(list);
+    };
+    const btn = tr.querySelector('button');
+    if (btn) btn.onclick = () => addTarget('pid', String(i.pid));
+    tbody.appendChild(tr);
+
+    if (procExpanded.has(i.pid)) {
+      const det = document.createElement('tr');
+      det.style.cursor = 'default';
+      det.innerHTML = `<td colspan="6"><div class="proc-cmdline">${escHtml(i.cmdline || '(cmdline 없음)')}</div>`
+        + `<div class="muted">exe: ${escHtml(i.exe_path || '-')} · uid: ${escHtml(i.uid)}`
+        + (i.error ? ` · ${escHtml(i.error)}` : '') + `</div></td>`;
+      tbody.appendChild(det);
+    }
+  });
+}
+
+async function addTarget(kind, value) {
+  try {
+    await fetch('/api/targets', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, value }),
+    }).then(r => { if (!r.ok) throw new Error(r.status); });
+    await refreshProcesses();
+  } catch (err) {
+    document.getElementById('proc-status').textContent = '  규칙 추가 실패: ' + err;
+  }
+}
+
+async function removeTarget(kind, value) {
+  await fetch(`/api/targets?kind=${encodeURIComponent(kind)}&value=${encodeURIComponent(value)}`,
+              { method: 'DELETE' });
+  await refreshProcesses();
+}
+
+// [한국어] 프로세스 목록은 주기 폴링하지 않는다 — /api/processes 1회가 실측
+// 60~90초 걸리기 때문(프로세스마다 drgn으로 mm->pgd부터 페이지테이블을 직접
+// 걸어 cmdline을 유저 메모리에서 읽는다, §9.15). 이걸 4초 간격으로 폴링하면
+// 단일 워커 executor(§9.8)에 영원히 못 따라가는 백로그가 쌓이고, 그 뒤에 줄
+// 선 /api/devices 같은 값싼 호출까지 수십 초씩 밀린다(실측: 브라우저 2개가
+// 폴링 중일 때 /api/devices가 44초 — 대시보드 전체가 사실상 멈춤).
+// 그래서 토폴로지 탭과 같은 방침으로, 탭 진입 시 1회 + 새로고침 버튼만 쓴다.
+// (세션 지표 WS는 이 경로를 안 타서 계속 실시간으로 둔다.)
+function stopProcPolling() {
+  if (procTimerId) { clearTimeout(procTimerId); procTimerId = null; }
+}
+
+function connectProfileWS() {
+  if (profileWs) { profileWs.onclose = null; profileWs.close(); profileWs = null; }
+  const myGen = ++profileWsGen;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/ws/profile?interval=2`);
+  profileWs = sock;
+  document.getElementById('profile-status').textContent = ' 연결 중...';
+  sock.onopen = () => { if (myGen === profileWsGen) document.getElementById('profile-status').textContent = ''; };
+  sock.onmessage = (ev) => renderProfile(JSON.parse(ev.data));
+  sock.onclose = () => {
+    if (myGen !== profileWsGen) return;
+    document.getElementById('profile-status').textContent = ' (연결 끊김 — 3초 뒤 재연결)';
+    setTimeout(() => { if (myGen === profileWsGen && state.activeTab === 'prof') connectProfileWS(); }, 3000);
+  };
+}
+
+function stopProfileWS() {
+  profileWsGen++;
+  if (profileWs) { profileWs.onclose = null; profileWs.close(); profileWs = null; }
+}
+
+function renderGroup(g) {
+  const verdict = !g.has_expectation
+    ? '<span class="verdict unknown">기대값 없음 — 판단 불가</span>'
+    : (g.expectation_match ? '<span class="verdict ok">일치 ✓</span>'
+                           : '<span class="verdict bad">불일치 ⚠</span>');
+  const e = g.expected_workload || {};
+  const m = g.measured_workload || {};
+  const expRow = e.has_spec
+    ? `<tr><th>기대</th><td>bs=${fmtBytes(e.io_size)}</td><td>rw=${escHtml(e.rw || '-')}</td>
+         <td>QD=${escHtml(e.queue_depth || '-')}</td><td>engine=${escHtml(e.ioengine || '-')}</td>
+         <td>direct=${e.direct ? 'Y' : 'N'}</td></tr>` : '';
+  const rw = (Number(m.read_ratio) || 0) * 100;
+  return `<div class="grp">
+    <div><b>${escHtml(g.name)}</b>
+      <span class="muted">[${escHtml(g.type)}${g.inferred ? ' · 추정' : ''} · ${escHtml(g.source)}]</span>
+      <span class="muted">스레드 ${(g.thread_tids || []).length}개</span> ${verdict}</div>
+    <table class="cmp-table">${expRow}
+      <tr><th>실측</th><td>bs=${fmtBytes(m.io_size_dominant)}</td>
+        <td>r/w=${rw.toFixed(0)}%/${(100 - rw).toFixed(0)}%</td>
+        <td>QD~${(Number(m.queue_depth_avg) || 0).toFixed(1)}</td>
+        <td>${fmtRate(m.iops)}</td>
+        <td>${((Number(m.bandwidth_bps) || 0) / 1e6).toFixed(1)} MB/s</td></tr>
+    </table>
+    ${(g.mismatch_reasons || []).map(r =>
+      `<div class="muted" style="margin-top:2px">· ${escHtml(r)}</div>`).join('')}
+  </div>`;
+}
+
+function renderProfile(snap) {
+  const warnBox = document.getElementById('profile-warnings');
+  const box = document.getElementById('profile-sessions');
+  warnBox.innerHTML = '';
+  (snap.devices || []).filter(d => d.multi_process_warning).forEach(d => {
+    const div = document.createElement('div');
+    div.className = 'warn-box';
+    div.textContent = `${d.name}: 여러 프로세스가 동시에 I/O 중 — 총 ${fmtRate(d.total_iops)} 중 `
+      + `귀속 ${fmtRate(d.attributed_iops)}, 미귀속 ${fmtRate(d.unattributed_iops)}. `
+      + '성능 수치를 한 프로세스에 귀속시킬 수 없습니다.';
+    warnBox.appendChild(div);
+  });
+  (snap.unmonitored_io || []).forEach(u => {
+    const div = document.createElement('div');
+    div.className = 'warn-box';
+    div.textContent = `관측 대상이 아닌 프로세스가 I/O 발행 중: pid ${u.pid} ${u.comm} → ${u.device} `
+      + `(${fmtRate(u.io_rate)})`;
+    warnBox.appendChild(div);
+  });
+
+  const sessions = snap.sessions || [];
+  box.innerHTML = '';
+  if (!sessions.length) {
+    box.innerHTML = '<div class="muted">활성 세션 없음 — 위에서 대상을 선택하면 즉시 세션이 만들어집니다.</div>';
+    return;
+  }
+  sessions.forEach(s => {
+    const agg = s.aggregate || {};
+    const card = document.createElement('div');
+    card.className = 'sess-card' + (s.status === 'finished' ? ' finished' : '');
+    card.innerHTML = `
+      <div class="sess-head">
+        <span class="event-kind ${s.status === 'active' ? 'error' : ''}">${escHtml(s.status)}</span>
+        <b>${escHtml(s.comm)}</b> <span class="muted">pid ${escHtml(s.pid)}</span>
+        <span class="topo-badge nvme_ctrl">adapter=${escHtml(s.adapter)}</span>
+        <span class="muted">규칙 ${escHtml(s.matched_rule || '-')}</span>
+        <span class="muted">장치 ${escHtml((s.devices || []).join(',') || '-')}</span>
+        <span class="muted">스레드 ${escHtml(s.thread_count_active)}</span>
+      </div>
+      <div class="muted" style="margin-top:2px">${escHtml(s.session_id)}</div>
+      <div class="proc-cmdline">${escHtml(s.cmdline || '(cmdline 없음)')}</div>
+      <div>합계 ${fmtRate(agg.iops)} · ${((Number(agg.bandwidth_bps) || 0) / 1e6).toFixed(1)} MB/s
+        · QD~${(Number(agg.queue_depth_avg) || 0).toFixed(1)}</div>
+      ${(s.logical_groups || []).map(renderGroup).join('')}`;
+    box.appendChild(card);
+  });
+}
+
+document.getElementById('proc-refresh').onclick = () => refreshProcesses();
+document.getElementById('proc-only-io').onchange = () => refreshProcesses();
+document.getElementById('rule-add').onclick = () => {
+  const kind = document.getElementById('rule-kind').value;
+  const value = document.getElementById('rule-value').value.trim();
+  if (value) { addTarget(kind, value); document.getElementById('rule-value').value = ''; }
+};
+
+// ===========================================================================
+// [한국어] 토폴로지 탭 — PCIe 계보 + NVMe 서브시스템 통합 트리.
+//
+// 서버(/api/topology)가 시스템 전체를 한 트리로 만들어 준다. 노드는 종류별
+// 필드 대신 details(key-value 목록)를 들고 오므로, 이 렌더러는 노드 종류를
+// 몰라도(모르는 kind가 와도) label/sublabel/details만으로 그릴 수 있다 —
+// 이벤트 봉투와 같은 규약.
+//
+// 상태: topoData(받은 트리), topoExpanded(펼친 노드 id 집합),
+// topoSelected(속성을 펼쳐 본 노드 id).
+// ===========================================================================
+let topoData = null;
+let topoLoading = false;
+let topoAutoExpandedFor = null;   // 마지막으로 경로를 자동 펼침한 디바이스
+const topoExpanded = new Set();
+const topoSelected = new Set();
+
+const TOPO_KIND_LABELS = {
+  system: '시스템', host_bridge: '호스트 브리지', pci_bridge: 'PCI 브리지',
+  pci_endpoint: 'PCIe 엔드포인트', nvme_ctrl: 'NVMe 컨트롤러',
+  nvme_subsystem: '서브시스템', namespace: '네임스페이스',
+  queue_group: '큐', queue: '큐',
+};
+
+async function loadTopology(force) {
+  if (topoLoading) return;
+  if (topoData && !force) { renderTopology(); return; }
+  topoLoading = true;
+  const statusEl = document.getElementById('topo-status');
+  statusEl.textContent = ' 조회 중... (drgn 라이브 조회라 수 초 걸릴 수 있습니다)';
+  document.getElementById('topo-tree').innerHTML = '<div class="muted">트리를 만드는 중...</div>';
+  try {
+    topoData = await getJSON('/api/topology');
+    statusEl.textContent = ` backend=${topoData.backend_kind || '?'}`;
+    renderTopology();
+  } catch (err) {
+    statusEl.textContent = '';
+    document.getElementById('topo-tree').innerHTML =
+      `<div class="muted">토폴로지 조회 실패: ${escHtml(err)}</div>`;
+  } finally {
+    topoLoading = false;
+  }
+}
+
+// [한국어] 선택된 디바이스로 가는 경로를 자동으로 펼치기 위해, 그 디바이스에
+// 속한 노드들의 조상 id를 모은다(노드는 자기가 속한 device를 들고 온다).
+function topoPathIds(node, device, acc, chain) {
+  const here = chain.concat([node.id]);
+  let hit = node.device === device;
+  (node.children || []).forEach(c => { if (topoPathIds(c, device, acc, here)) hit = true; });
+  if (hit) here.forEach(id => acc.add(id));
+  return hit;
+}
+
+function renderTopologyNode(node, device, onPath) {
+  const kind = node.kind || '';
+  const children = node.children || [];
+  const hasKids = children.length > 0;
+  const expanded = topoExpanded.has(node.id);
+  const showDetails = topoSelected.has(node.id) || document.getElementById('topo-details-all').checked;
+  const mine = node.device && node.device === device;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'topo-node';
+
+  const row = document.createElement('div');
+  row.className = 'topo-row' + (mine ? ' selected' : '') + (onPath.has(node.id) && !mine ? ' on-path' : '');
+  row.innerHTML =
+    `<span class="topo-toggle">${hasKids ? (expanded ? '▾' : '▸') : ''}</span>` +
+    `<span class="topo-badge ${escHtml(kind)}">${escHtml(TOPO_KIND_LABELS[kind] || kind)}</span>` +
+    `<span class="topo-label">${escHtml(node.label)}</span>` +
+    (node.sublabel ? `<span class="topo-sub">— ${escHtml(node.sublabel)}</span>` : '') +
+    (hasKids ? `<span class="topo-sub">(${children.length})</span>` : '');
+  row.onclick = (ev) => {
+    // [한국어] 토글 화살표를 누르면 접기/펼치기, 그 외 영역은 속성 보기 —
+    // 트리가 깊어서 "펼치려다 속성이 뜨는" 오조작을 막으려는 분리.
+    if (ev.target.classList.contains('topo-toggle')) {
+      if (expanded) topoExpanded.delete(node.id); else topoExpanded.add(node.id);
+    } else {
+      if (topoSelected.has(node.id)) topoSelected.delete(node.id); else topoSelected.add(node.id);
+    }
+    renderTopology();
+  };
+  wrap.appendChild(row);
+
+  if (showDetails && (node.details || []).length) {
+    const box = document.createElement('div');
+    box.className = 'topo-details';
+    box.innerHTML = '<table>' + node.details.map(d =>
+      `<tr><th>${escHtml(d.key)}</th><td>${escHtml(d.value)}</td></tr>`).join('') + '</table>';
+    wrap.appendChild(box);
+  }
+
+  if (hasKids && expanded) {
+    const kidBox = document.createElement('div');
+    kidBox.className = 'topo-children';
+    children.forEach(c => kidBox.appendChild(renderTopologyNode(c, device, onPath)));
+    wrap.appendChild(kidBox);
+  }
+  return wrap;
+}
+
+// [한국어] id -> kind 맵. 자동 펼침에서 큐 그룹만 빼려면 id로 종류를 알아야 한다.
+function topoKindMap(node, acc) {
+  acc[node.id] = node.kind;
+  (node.children || []).forEach(c => topoKindMap(c, acc));
+  return acc;
+}
+
+function renderTopology() {
+  if (!topoData || !topoData.root) return;
+  const box = document.getElementById('topo-tree');
+  const device = state.device;
+  const onPath = new Set();
+  if (device) topoPathIds(topoData.root, device, onPath, []);
+  // [한국어] 선택된 장치까지의 경로를 자동으로 펼친다 — 트리를 열자마자 "내
+  // 장치가 어디에 붙어 있는지"가 보여야 이 화면의 값이 산다. 디바이스를 바꾸면
+  // 새 경로도 같은 방식으로 펼치되(topoAutoExpandedFor로 1회만), 사용자가 직접
+  // 열어 둔 노드는 건드리지 않는다.
+  // 큐 그룹은 자식이 9개씩이라 자동 펼침에서 빼고 직접 열게 둔다 — 안 그러면
+  // 트리를 열자마자 큐 목록이 화면을 다 차지한다(실측 17개 중 9개가 큐였음).
+  if (device && topoAutoExpandedFor !== device) {
+    topoAutoExpandedFor = device;
+    const kinds = topoKindMap(topoData.root, {});
+    onPath.forEach(id => { if (kinds[id] !== 'queue_group') topoExpanded.add(id); });
+    topoExpanded.add(topoData.root.id);
+  }
+  box.innerHTML = '';
+  box.appendChild(renderTopologyNode(topoData.root, device, onPath));
+  if (topoData.error) {
+    const warn = document.createElement('div');
+    warn.className = 'muted';
+    warn.style.marginTop = '8px';
+    warn.textContent = '일부 장치를 못 읽음: ' + topoData.error;
+    box.appendChild(warn);
+  }
+}
+
+document.getElementById('topo-refresh').onclick = () => loadTopology(true);
+document.getElementById('topo-details-all').onchange = () => renderTopology();
+
+// [한국어] 이벤트 WS — 이벤트 탭 전용 생명주기(연결/자동재연결 3초/탭·디바이스
+// 전환 시 정리). 전에는 성능 WS에 얹혀 있었지만, 탭이 분리되면서 성능 탭을
+// 안 보는 동안 이벤트 스트림이 같이 죽는 게 맞지 않아 독립시켰다.
+let eventsWs = null;
+let eventsWsGen = 0;
+function connectEventsWS(device) {
+  if (eventsWs) { eventsWs.onclose = null; eventsWs.close(); eventsWs = null; }
+  const myGen = ++eventsWsGen;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/ws/devices/${device}/events?interval=1`);
+  eventsWs = sock;
+  document.getElementById('event-status').textContent = ' 연결 중...';
+  sock.onmessage = (ev) => renderEvents(JSON.parse(ev.data));
+  sock.onclose = () => {
+    if (myGen !== eventsWsGen) return;   // 이미 다른 연결로 교체됨 — 무시
+    document.getElementById('event-status').textContent = ' (연결 끊김 — 3초 뒤 자동 재연결)';
+    setTimeout(() => {
+      if (myGen === eventsWsGen && state.device === device && state.activeTab === 'event') connectEventsWS(device);
+    }, 3000);
+  };
+}
+
+function stopEventsWS(idleText) {
+  eventsWsGen++;
+  if (eventsWs) { eventsWs.onclose = null; eventsWs.close(); eventsWs = null; }
+  const el = document.getElementById('event-status');
+  if (el && idleText) el.textContent = ' ' + idleText;
+}
+
+document.getElementById('event-refresh').onclick = () => {
+  lastEventSig = null;
+  if (state.device) connectEventsWS(state.device);
+};
+
+document.getElementById('event-kind-filter').onchange = (ev) => {
+  state.eventKindFilter = ev.target.value;
+  lastEventSig = null;   // 필터가 바뀌면 같은 데이터라도 다시 그려야 한다
+  if (state.device) connectEventsWS(state.device);
+};
+
+document.getElementById('perf-refresh').onclick = () => {
+  if (state.device) connectPerfWS(state.device);
+};
+
+function perfRowCells(q) {
+  const bwMb = (Number(q.bandwidth_bytes_per_sec) || 0) / 1e6;
+  const n1 = v => (Number(v) || 0).toFixed(0);
+  const n1f = v => (Number(v) || 0).toFixed(1);
+  return `<td>${n1(q.iops)}</td><td>${n1(q.read_iops)}</td><td>${n1(q.write_iops)}</td>
+    <td>${bwMb.toFixed(2)}</td><td>${n1f(q.avg_latency_us)}</td>
+    <td>${n1f(q.p50_latency_us)}</td><td>${n1f(q.p95_latency_us)}</td>
+    <td>${n1f(q.p99_latency_us)}</td><td>${n1f(q.p999_latency_us)}</td>`;
+}
+
+function perfSample(q) {
+  return {
+    iops: Number(q.iops) || 0,
+    read_iops: Number(q.read_iops) || 0,
+    write_iops: Number(q.write_iops) || 0,
+    bw: Number(q.bandwidth_bytes_per_sec) || 0,
+    avg: Number(q.avg_latency_us) || 0,
+    p99: Number(q.p99_latency_us) || 0,
+  };
+}
+
+function pushPerfHistory(key, sample) {
+  const arr = state.perfHistory[key] || (state.perfHistory[key] = []);
+  arr.push(sample);
+  if (arr.length > PERF_HISTORY_LEN) arr.shift();
+}
+
+function renderPerf(perf) {
+  const statusEl = document.getElementById('perf-status');
+  const tbody = document.querySelector('#perf-table tbody');
+  const tfoot = document.querySelector('#perf-table tfoot');
+  if (!perf.available) {
+    statusEl.textContent = '  ' + (perf.error || '데이터 없음');
+    tbody.innerHTML = '';
+    tfoot.innerHTML = '';
+    return;
+  }
+  statusEl.textContent = '';
+  tbody.innerHTML = '';
+  (perf.queues || []).forEach(q => {
+    const key = String(q.qid);
+    const tr = document.createElement('tr');
+    if (state.perfSelectedQid === key) tr.classList.add('selected');
+    tr.innerHTML = `<td>${q.qid || 0}</td>` + perfRowCells(q);
+    tr.onclick = () => selectPerfQueue(key, `Queue ${q.qid}`, tr);
+    tbody.appendChild(tr);
+    pushPerfHistory(key, perfSample(q));
+  });
+  // [한국어] 전체 큐 합산(aggregate, qid=-1) — 개별 큐 percentile은 표본 수가
+  // 적어 버킷이 들쭉날쭉할 수 있어, 디바이스 전체로 합친 안정적인 값을
+  // tfoot에 고정 행으로 따로 보여준다(사용자 요청: "디바이스 전체 합산도").
+  tfoot.innerHTML = '';
+  if (perf.aggregate) {
+    const key = 'agg';
+    const tr = document.createElement('tr');
+    tr.className = 'perf-agg-row';
+    if (state.perfSelectedQid === key) tr.classList.add('selected');
+    tr.innerHTML = `<td>전체</td>` + perfRowCells(perf.aggregate);
+    tr.onclick = () => selectPerfQueue(key, '전체 디바이스', tr);
+    tfoot.appendChild(tr);
+    pushPerfHistory(key, perfSample(perf.aggregate));
+  }
+  if (state.perfSelectedQid !== null) drawPerfDetail();
+}
+
+// ---- 큐 클릭 시 작업 관리자 스타일 실시간 그래프(요청사항: "Windows 작업
+// 관리자 - 성능 탭"처럼 실시간 수치 + 시계열 그래프) ----------------------
+//
+// 서버는 매 틱의 "순간값"만 주므로(누적 아님), 이력은 순전히 클라이언트가
+// WebSocket 메시지를 받을 때마다 쌓는다(renderPerf의 pushPerfHistory) — 탭을
+// 벗어나 있던 동안은 연결이 끊겨 있어 그 구간은 그래프에 비지만, 다시 열면
+// 그 시점부터 다시 쌓인다.
+
+function selectPerfQueue(key, label, rowEl) {
+  state.perfSelectedQid = key;
+  document.querySelectorAll('#perf-table tbody tr, #perf-table tfoot tr').forEach(tr => tr.classList.remove('selected'));
+  if (rowEl) rowEl.classList.add('selected');
+  document.getElementById('perf-detail-panel').style.display = '';
+  document.getElementById('perf-detail-title').textContent = label;
+  document.getElementById('perf-hist-len').textContent = String(PERF_HISTORY_LEN);
+  drawPerfDetail();
+}
+
+document.getElementById('perf-detail-close').onclick = () => {
+  state.perfSelectedQid = null;
+  document.getElementById('perf-detail-panel').style.display = 'none';
+  document.querySelectorAll('#perf-table tbody tr, #perf-table tfoot tr').forEach(tr => tr.classList.remove('selected'));
+};
+
+function drawPerfDetail() {
+  const hist = state.perfHistory[state.perfSelectedQid] || [];
+  const latest = hist[hist.length - 1];
+  drawChart('perf-chart-iops',
+    [{ data: hist.map(s => s.read_iops), color: '#59a6ff' },
+     { data: hist.map(s => s.write_iops), color: '#e0b341' }],
+    latest ? `${latest.iops.toFixed(0)} IOPS` : '-');
+  drawChart('perf-chart-bw',
+    [{ data: hist.map(s => s.bw / 1e6), color: '#58c774' }],
+    latest ? `${(latest.bw / 1e6).toFixed(1)} MB/s` : '-');
+  drawChart('perf-chart-lat',
+    [{ data: hist.map(s => s.avg), color: '#59a6ff' },
+     { data: hist.map(s => s.p99), color: '#f0665a' }],
+    latest ? `avg ${latest.avg.toFixed(0)} / p99 ${latest.p99.toFixed(0)} µs` : '-');
+}
+
+function drawChart(canvasId, series, valueLabel) {
+  const canvas = document.getElementById(canvasId);
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 260;
+  const cssH = canvas.clientHeight || 110;
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  // 가로 그리드라인(Task Manager 느낌의 옅은 눈금)
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = Math.round(cssH * i / 4) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cssW, y); ctx.stroke();
+  }
+
+  const allVals = series.flatMap(s => s.data).filter(Number.isFinite);
+  const max = Math.max(1, ...allVals);
+  const pad = cssH * 0.06;
+  series.forEach(s => {
+    if (s.data.length < 2) return;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    s.data.forEach((v, i) => {
+      const x = (i / (PERF_HISTORY_LEN - 1)) * cssW;   // 고정 폭 기준 스크롤(왼쪽이 과거)
+      const y = cssH - pad - (Math.max(0, v) / max) * (cssH - 2 * pad);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+
+  const valueEl = document.getElementById(canvasId + '-value');
+  if (valueEl) valueEl.textContent = valueLabel;
+}
+
+function renderSnapshot(snap) {
+  document.getElementById('snapshot-meta').textContent =
+    `  addr=${snap.addr} model="${snap.model}" backend=${snap.backend_kind} iommu=${snap.iommu_enabled ? 'on' : 'off'}`;
+  const tbody = document.querySelector('#queue-table tbody');
+  tbody.innerHTML = '';
+  (snap.queues || []).forEach(q => {
+    const tr = document.createElement('tr');
+    if (String(q.qid) === String(state.qid)) tr.classList.add('selected');
+    tr.innerHTML = `<td>${q.qid}</td>
+      <td><span class="badge ${q.is_admin ? 'admin' : 'io'}">${q.is_admin ? 'ADMIN' : 'IO'}</span></td>
+      <td>${q.depth}</td><td>${q.sq_tail}</td><td>${q.cq_head}</td>
+      <td>${q.is_admin ? '-' : (q.hctx_index || 0)}</td>
+      <td>${q.inflight_driver || 0}</td><td>${q.inflight_sched || 0}</td>`;
+    tr.onclick = () => { loadEntries(q.qid); startEntriesAutoRefresh(); };
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadEntries(qid) {
+  state.qid = qid;
+  document.querySelectorAll('#queue-table tbody tr').forEach((tr, i) => tr.classList.remove('selected'));
+  // [한국어] entries+completions 조회는 drgn/QMP 백엔드가 바쁠 때 수 초까지
+  // 걸릴 수 있다(단일 워커로 직렬화되어 있어서 — 큐 스냅샷 WebSocket과도
+  // 자원을 나눠 씀). 그동안 화면이 이전 내용 그대로 멈춰 있으면 "먹통"처럼
+  // 보이니 즉시 "조회 중" 표시부터 남긴다.
+  document.getElementById('entries-info').textContent = `device=${state.device} qid=${qid} 조회 중...`;
+  document.getElementById('cq-info').textContent = `device=${state.device} qid=${qid} 조회 중...`;
+  await Promise.all([loadSqEntries(qid), loadCqEntries(qid)]);
+}
+
+document.getElementById('entries-refresh').onclick = () => {
+  // [한국어] state.qid는 admin이면 0일 수 있어 truthy 체크(!state.qid) 대신
+  // null/undefined만 걸러낸다 — qid=0 큐 새로고침이 씹히는 버그를 피하려고.
+  if (state.qid === null || state.qid === undefined) return;
+  loadEntries(state.qid);
+};
+
+// [한국어] SQ/CQ 엔트리는 스냅샷/성능과 달리 WebSocket 푸시가 없어 한 번
+// 조회하면 그대로 굳어 있었다 — 큐를 고른 동안은 주기적으로 다시 조회해
+// "전체 기능 auto refresh" 요구사항을 채운다. 탭이 안 보이거나 체크박스를
+// 끄면 멈춘다(자원 낭비 방지).
+//
+// setInterval이 아니라 "이전 조회가 끝난 뒤에만 다음 걸 예약"하는 재귀
+// setTimeout을 쓴다 — drgn/QMP 백엔드 기준 entries+completions 조회가
+// 2초보다 오래 걸릴 수 있는데(실측 조합 약 2.3초), 고정 setInterval(2000)
+// 이면 응답이 늦어질 때마다 요청이 서버에 계속 쌓인다(§9.7 근처에서 실제로
+// 겪은 "탭 반복 전환 → 이후 요청이 수십 초씩 밀림"과 같은 유형의 문제 —
+// 여긴 WS가 아니라 REST라 취소할 수도 없어서 애초에 쌓이지 않게 막아야 함).
+let entriesTimerId = null;
+let entriesGen = 0;   // [한국어] stop 이후에 살아남은 예약이 잘못 실행되는 걸 막는 세대 번호.
+function stopEntriesAutoRefresh() {
+  entriesGen++;
+  if (entriesTimerId) { clearTimeout(entriesTimerId); entriesTimerId = null; }
+}
+function startEntriesAutoRefresh() {
+  stopEntriesAutoRefresh();
+  if (!document.getElementById('entries-auto').checked) return;
+  if (state.qid === null || state.qid === undefined) return;
+  if (state.activeTab !== 'queue') return;
+  const myGen = entriesGen;
+  const qid = state.qid;
+  const tick = async () => {
+    if (myGen !== entriesGen || state.qid !== qid || state.activeTab !== 'queue') return;
+    await loadEntries(qid);
+    if (myGen !== entriesGen || state.qid !== qid || state.activeTab !== 'queue') return;
+    entriesTimerId = setTimeout(tick, 2000);
+  };
+  entriesTimerId = setTimeout(tick, 2000);
+}
+document.getElementById('entries-auto').onchange = () => {
+  if (document.getElementById('entries-auto').checked) startEntriesAutoRefresh();
+  else stopEntriesAutoRefresh();
+};
+
+async function loadSqEntries(qid) {
+  const reply = await getJSON(`/api/devices/${state.device}/queues/${qid}/entries?limit=16&around_doorbell=true`);
+  document.getElementById('entries-info').textContent =
+    `device=${reply.device} qid=${reply.qid} — sq_tail 도어벨 기준 최근 ${reply.entries.length}개`;
+  const tbody = document.querySelector('#entries-table tbody');
+  tbody.innerHTML = '';
+  (reply.entries || []).forEach(e => {
+    const tr = document.createElement('tr');
+    const sgl = e.uses_sgl;
+    tr.innerHTML = `<td>${e.index}</td><td>${e.cid}</td>
+      <td>${e.opcode_name} <span class="pill">0x${(+e.opcode).toString(16).padStart(2,'0')}</span></td>
+      <td>${e.nsid}</td><td>0x${(+e.flags).toString(16).padStart(2,'0')} ${sgl ? '<span class=\"warn\">SGL</span>' : 'PRP'}</td>
+      <td>${fmtHex(e.cdw2)}</td><td>${fmtHex(e.cdw3)}</td>
+      <td>${fmtHex(e.cdw10)}</td><td>${fmtHex(e.cdw11)}</td><td>${fmtHex(e.cdw12)}</td>
+      <td>${fmtHex(e.cdw13)}</td><td>${fmtHex(e.cdw14)}</td><td>${fmtHex(e.cdw15)}</td>
+      <td>${sgl ? '-' : (e.prp1 || '0x0')}</td><td>${sgl ? '-' : (e.prp2 || '0x0')}</td>
+      <td>${sgl ? '' : `<button class="small">PRP 확인</button>`}</td>`;
+    if (!sgl) tr.querySelector('button').onclick = () => loadPrp(qid, e.cid);
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadCqEntries(qid) {
+  const reply = await getJSON(`/api/devices/${state.device}/queues/${qid}/completions?limit=16&around_doorbell=true`);
+  document.getElementById('cq-info').textContent =
+    `device=${reply.device} qid=${reply.qid} — cq_head 도어벨 기준 최근 ${reply.entries.length}개`;
+  const tbody = document.querySelector('#cq-table tbody');
+  tbody.innerHTML = '';
+  (reply.entries || []).forEach(e => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${e.index}</td><td>${e.command_id}</td><td>${e.sq_id}</td><td>${e.sq_head}</td>
+      <td>${e.phase ? 1 : 0}</td><td>${e.status_code_type}</td>
+      <td>0x${(+e.status_code).toString(16).padStart(2,'0')}</td>
+      <td>0x${(+e.status_raw).toString(16).padStart(4,'0')}</td>
+      <td>0x${(+e.result).toString(16).padStart(8,'0')}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function fmtHex(v) { return '0x' + (Number(v) || 0).toString(16).padStart(8, '0'); }
+
+async function loadPrp(qid, cid) {
+  const panel = document.getElementById('prp-panel');
+  panel.style.display = '';
+  document.getElementById('prp-meta').textContent = `  device=${state.device} qid=${qid} cid=${cid} 조회 중...`;
+  document.getElementById('prp-body').innerHTML = '';
+  const reply = await getJSON(`/api/devices/${state.device}/queues/${qid}/prp/${cid}`);
+  document.getElementById('prp-meta').textContent =
+    `  device=${reply.device} qid=${reply.qid} cid=${reply.cid} total_len=${reply.total_len} pages=${(reply.pages||[]).length}`;
+  const body = document.getElementById('prp-body');
+  body.innerHTML = '';
+  if (reply.uses_sgl) {
+    body.innerHTML = '<div class="warn">이 커맨드는 SGL 경로(PSDT!=0) — PRP 해독 대상이 아닙니다.</div>';
+    return;
+  }
+  if (reply.error) body.innerHTML += `<div class="warn">[안내] ${reply.error}</div>`;
+  (reply.pages || []).forEach((p, i) => {
+    const title = document.createElement('div');
+    title.className = 'muted';
+    title.textContent = `${p.is_list_page ? 'LIST' : 'DATA[' + i + ']'} phys=${p.phys_addr} offset=${p.offset_in_page} bytes=${p.data_hex.length / 2}`;
+    body.appendChild(title);
+    const pre = document.createElement('div');
+    pre.className = 'hexdump';
+    pre.textContent = hexdump(p.data_hex, Number(p.phys_addr));
+    body.appendChild(pre);
+  });
+}
+
+function hexdump(hex, baseAddr) {
+  const bytes = [];
+  for (let i = 0; i < hex.length; i += 2) bytes.push(parseInt(hex.substr(i, 2), 16));
+  const lines = [];
+  for (let off = 0; off < bytes.length; off += 16) {
+    const chunk = bytes.slice(off, off + 16);
+    const hexs = chunk.map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(47, ' ');
+    const asci = chunk.map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('');
+    lines.push(`${'0x' + (baseAddr + off).toString(16).padStart(10, '0')}  ${hexs}  |${asci}|`);
+  }
+  return lines.join('\n');
+}
+
+document.getElementById('prp-close').onclick = () => {
+  document.getElementById('prp-panel').style.display = 'none';
+};
+
+// ---- 포인터 트리 탐색기 (in-place 접기/펼치기, 요청사항 4/6) ----
+//
+// 각 노드는 처음 만들어질 때 딱 한 번만 서버에 조회한다(그 노드 자신의 요약 +
+// 바로 다음 자식들의 요약). 자식을 실제로 DOM에 붙이는 건 사용자가 그 노드를
+// 처음 펼칠 때(lazy)뿐이고, 이후 접었다 펼쳤다 하는 건 순수 CSS display
+// 토글이라 재조회하지 않는다 — "줄였다 늘였다"를 자연스럽게 만족.
+// (구조 탐색기라 스냅샷/성능과 달리 auto refresh 대상에서 제외했다 — 트리
+// 형태가 매 초 바뀌지 않고, 펼쳐놓은 노드를 주기적으로 다시 조회하면
+// 사용자가 눌러서 펼쳐/접은 상태가 자기도 모르게 리셋될 위험이 더 크다.)
+
+async function buildTreeNode(device, path) {
+  const container = document.createElement('div');
+  container.className = 'tnode';
+  const header = document.createElement('div');
+  header.className = 'tnode-header';
+  header.textContent = '불러오는 중...';
+  container.appendChild(header);
+  const childrenDiv = document.createElement('div');
+  childrenDiv.className = 'tnode-children';
+  childrenDiv.style.display = 'none';
+  container.appendChild(childrenDiv);
+
+  let reply;
+  try {
+    const qs = path.map(p => 'path=' + encodeURIComponent(p)).join('&');
+    reply = await getJSON(`/api/devices/${device}/tree${qs ? '?' + qs : ''}`);
+  } catch (e) {
+    header.innerHTML = `<span class="err">${escapeHtml(String(e))}</span>`;
+    return container;
+  }
+
+  const n = reply.node;
+  const toggleSpan = document.createElement('span');
+  toggleSpan.className = 'toggle';
+  toggleSpan.textContent = n.expandable ? '▶' : '·';
+  const label = document.createElement('span');
+  label.innerHTML =
+    `<b>${escapeHtml(n.name)}</b> <span class="kind">[${n.kind}]</span> ${escapeHtml(n.type_name)} — ${escapeHtml(n.value_repr || '')}` +
+    (n.address ? ` <span class="muted">@ ${n.address}</span>` : '');
+  header.innerHTML = '';
+  header.appendChild(toggleSpan);
+  header.appendChild(label);
+
+  if (reply.error) {
+    const errDiv = document.createElement('div');
+    errDiv.className = 'err';
+    errDiv.style.marginLeft = '18px';
+    errDiv.textContent = reply.error;
+    container.appendChild(errDiv);
+  }
+
+  if (n.expandable) {
+    header.classList.add('expandable');
+    let expanded = false;
+    let loadedChildren = false;
+    header.onclick = async () => {
+      expanded = !expanded;
+      toggleSpan.textContent = expanded ? '▼' : '▶';
+      if (expanded) {
+        childrenDiv.style.display = '';
+        if (!loadedChildren) {
+          loadedChildren = true;
+          for (const c of reply.children) {
+            const childEl = await buildTreeNode(device, [...path, c.name]);
+            childrenDiv.appendChild(childEl);
+          }
+        }
+      } else {
+        childrenDiv.style.display = 'none';
+      }
+    };
+  }
+  return container;
+}
+
+document.getElementById('load-nvme-dev-btn').onclick = async () => {
+  if (!state.device) return;
+  const rootEl = document.getElementById('tree-root');
+  rootEl.innerHTML = '불러오는 중...';
+  const node = await buildTreeNode(state.device, []);
+  rootEl.innerHTML = '';
+  rootEl.appendChild(node);
+  // [한국어] 루트는 사용자가 방금 누른 버튼의 결과이므로 바로 펼쳐서 보여준다.
+  node.querySelector('.tnode-header.expandable')?.click();
+};
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.getElementById('perf-hist-len').textContent = String(PERF_HISTORY_LEN);
+loadDevices();
+</script>
+</body>
+</html>

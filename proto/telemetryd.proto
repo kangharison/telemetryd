@@ -1,0 +1,482 @@
+syntax = "proto3";
+
+package telemetryd;
+
+// telemetryd gRPC 서비스 — src/telemetryd (순수 python lib) 을 감싸는 wrapper.
+// 서버 구현은 src/telemetryd/grpcserver/server.py, 이 서비스가 실제로 호출하는
+// 로직(백엔드 선택/데이터 조회)은 전부 라이브러리 코어에 있다 — 여기는 직렬화만.
+service Telemetryd {
+  // 등록된 nvme 컨트롤러 이름 목록 (예: "nvme0", "nvme1").
+  rpc ListDevices(Empty) returns (DeviceListReply);
+
+  // struct nvme_dev 요약 스냅샷 1개 (큐 목록/inflight 포함).
+  rpc GetDeviceSnapshot(DeviceRequest) returns (DeviceSnapshot);
+
+  // 특정 큐의 SQ 엔트리(cdw 필드 포함) — 기본은 sq_tail 도어벨 기준 최근 N개.
+  rpc GetQueueEntries(QueueRequest) returns (QueueEntriesReply);
+
+  // 특정 큐의 CQ 엔트리 — 기본은 cq_head 도어벨 기준 최근 N개.
+  rpc GetCompletionEntries(QueueRequest) returns (CompletionEntriesReply);
+
+  // 특정 커맨드(cid)의 PRP 페이로드를 페이지 단위(최대 4096B)로 hexdump.
+  rpc GetPrpPayload(PrpRequest) returns (PrpPayloadReply);
+
+  // 포인터 트리 lazy expansion. path 길이는 서버에서 <=10 으로 강제.
+  rpc GetTreeNode(TreeNodeRequest) returns (TreeNodeReply);
+
+  // 실시간 폴링 스트림 — sq_tail/cq_head/inflight 변화를 interval마다 push.
+  rpc StreamDeviceMetrics(StreamRequest) returns (stream DeviceSnapshot);
+
+  // eBPF(nvme:nvme_setup_cmd/nvme_complete_rq)로 집계한 큐별 IOPS/대역폭/
+  // 평균 레이턴시 1회 스냅샷.
+  rpc GetPerformance(DeviceRequest) returns (DevicePerf);
+
+  // 위와 같은 데이터를 interval마다 push하는 실시간 스트림.
+  rpc StreamPerformance(StreamRequest) returns (stream DevicePerf);
+
+  // 이 디바이스에서 관측된 최근 NVMe 이벤트 목록(최대 최근 200개, 발생순).
+  // **종류를 가리지 않는다** — 지금은 eBPF kprobe:nvme_timeout이 잡은
+  // kind="timeout"만 들어오지만 리셋/AER 같은 다른 종류가 추가되면 같은
+  // 목록에 섞여 나온다. 하나도 없었으면 빈 목록.
+  rpc GetEvents(DeviceRequest) returns (EventsReply);
+
+  // 위와 같은 목록을 interval마다 통째로 다시 push하는 실시간 스트림(웹
+  // 대시보드의 "이벤트" 탭 — DESIGN.md §9.11).
+  rpc StreamEvents(StreamRequest) returns (stream EventsReply);
+
+  // 에러 완료(kind="error")의 SCT/SC 조합별 **누적** 카운터. 이벤트 목록과
+  // 성격이 다르다 — 목록은 개별 건(최근 200개, 폭주 시 샘플링), 이건 전수
+  // 집계(수집기 시작 이후 누적).
+  rpc GetErrorStats(DeviceRequest) returns (ErrorStatsReply);
+
+  // PCIe 토폴로지와 NVMe 서브시스템 구조를 하나로 합친 통합 트리. 노드 수가
+  // 수십 개 수준이라 lazy 확장(GetTreeNode)과 달리 한 번에 전부 보낸다.
+  rpc GetTopology(Empty) returns (TopologyReply);
+
+  // ---- NVMe I/O 프로세스 프로파일러 (대상은 런타임에 선택) ----
+  // 대상 후보 프로세스 목록. only_io=true면 최근 NVMe I/O를 낸 프로세스만.
+  rpc ListProcesses(ProcessListRequest) returns (ProcessListReply);
+  // 대상 선택 규칙 조회/추가/제거 — 데몬 재시작 없이 런타임에 바뀐다.
+  rpc ListTargets(Empty) returns (TargetsReply);
+  rpc AddTarget(TargetRuleMsg) returns (TargetsReply);
+  rpc RemoveTarget(TargetRuleMsg) returns (TargetsReply);
+  // 프로파일 스냅샷(세션/논리 그룹/기대 대조/미관측 I/O/장치 귀속).
+  rpc GetProfile(Empty) returns (ProfileReply);
+  rpc StreamProfile(StreamRequest) returns (stream ProfileReply);
+
+  // 이 시스템에 등록된 이벤트 종류 목록 — UI/CLI가 "무엇을 수집 중인지"를
+  // 하드코딩하지 않고 물어보기 위한 것.
+  rpc ListEventKinds(Empty) returns (EventKindsReply);
+}
+
+message Empty {}
+
+message DeviceListReply {
+  repeated string names = 1;
+}
+
+message DeviceRequest {
+  string device = 1;   // "nvme0"
+}
+
+message StreamRequest {
+  string device = 1;
+  double interval_sec = 2;   // 0이면 서버 기본값(0.5s) 사용
+}
+
+message QueueSnapshot {
+  int32 index = 1;          // dev.queues[] 배열 인덱스
+  int32 qid = 2;             // 실제 qid, 0=Admin
+  bool is_admin = 3;
+  int32 depth = 4;           // q_depth
+  int32 sq_tail = 5;
+  int32 cq_head = 6;
+  string sq_dma_addr = 7;    // hex 문자열 (64bit라 JS/proto 양쪽 안전하게 문자열로)
+  string cq_dma_addr = 8;
+  int32 hctx_index = 9;      // admin이면 -1
+  int32 inflight_driver = 10;
+  int32 inflight_sched = 11;
+}
+
+message DeviceSnapshot {
+  string name = 1;
+  string addr = 2;             // struct nvme_dev* hex
+  string model = 3;
+  int32 online_queues = 4;
+  int32 allocated_queues = 5;
+  string bar_addr = 6;
+  string dbs_addr = 7;
+  bool iommu_enabled = 8;
+  repeated QueueSnapshot queues = 9;
+  string backend_kind = 10;    // "mock" | "drgn"
+}
+
+message QueueRequest {
+  string device = 1;
+  int32 qid = 2;
+  int32 limit = 3;              // 0이면 16으로 취급(around_doorbell=true 시) 또는 전체(false 시)
+  bool around_doorbell = 4;     // true(기본 취급): sq_tail/cq_head 도어벨 바로 앞 limit개
+}
+
+message QueueEntry {
+  int32 index = 1;
+  int32 cid = 2;
+  int32 opcode = 3;
+  string opcode_name = 4;
+  uint32 nsid = 5;   // u32 — 0xFFFFFFFF(broadcast)가 정상 값이라 int32면 범위 초과
+  int32 flags = 6;
+  bool uses_sgl = 7;      // PSDT != 0
+  uint32 cdw2 = 8;
+  uint32 cdw3 = 9;
+  uint32 cdw10 = 10;
+  uint32 cdw11 = 11;
+  uint32 cdw12 = 12;
+  uint32 cdw13 = 13;
+  uint32 cdw14 = 14;
+  uint32 cdw15 = 15;
+  string prp1 = 16;
+  string prp2 = 17;
+}
+
+message QueueEntriesReply {
+  string device = 1;
+  int32 qid = 2;
+  repeated QueueEntry entries = 3;
+}
+
+message CompletionEntry {
+  int32 index = 1;
+  int32 command_id = 2;
+  int32 sq_id = 3;
+  int32 sq_head = 4;
+  int32 status_raw = 5;
+  bool phase = 6;
+  int32 status_code = 7;
+  int32 status_code_type = 8;
+  uint32 result = 9;
+}
+
+message CompletionEntriesReply {
+  string device = 1;
+  int32 qid = 2;
+  repeated CompletionEntry entries = 3;
+}
+
+message PrpRequest {
+  string device = 1;
+  int32 qid = 2;
+  int32 cid = 3;
+}
+
+message PrpPage {
+  string phys_addr = 1;
+  int32 offset_in_page = 2;
+  bytes data = 3;          // 최대 4096바이트
+  bool is_list_page = 4;
+}
+
+message PrpPayloadReply {
+  string device = 1;
+  int32 qid = 2;
+  int32 cid = 3;
+  bool uses_sgl = 4;        // true면 이하 필드 비어있음(PRP 해독 대상 아님)
+  int64 total_len = 5;
+  repeated PrpPage pages = 6;
+  string error = 7;         // 요청을 못 찾음(이미 완료) 등
+}
+
+message TreeNodeRequest {
+  string device = 1;
+  repeated string path = 2;   // 필드명/인덱스 시퀀스, 루트는 빈 배열
+}
+
+message TreeNode {
+  string name = 1;           // 필드명 또는 "[idx]" 또는 루트면 타입명
+  string type_name = 2;
+  string kind = 3;            // "struct"|"pointer"|"array"|"scalar"|"string"|"unreadable"
+  string value_repr = 4;      // 스칼라 값 문자열 표현
+  string address = 5;         // 집합 타입/포인터의 주소(hex), 스칼라면 빈 문자열
+  bool is_null = 6;
+  bool expandable = 7;        // 더 들어갈 수 있는지 (depth 10 초과 시 false)
+}
+
+message TreeNodeReply {
+  TreeNode node = 1;
+  repeated TreeNode children = 2;
+  int32 depth = 3;
+  string error = 4;
+}
+
+message QueuePerf {
+  int32 qid = 1;   // qid=-1 이면 "이 디바이스의 전체 큐 합산" 행(DevicePerf.aggregate 전용, 실제 큐 아님)
+  double iops = 2;
+  double read_iops = 3;
+  double write_iops = 4;
+  double bandwidth_bytes_per_sec = 5;
+  double avg_latency_us = 6;
+  // p50/p95/p99/p99.9 — bpftrace hist()의 2배수 버킷 상한을 percentile 근사치로 씀
+  // (bcc의 biolatency/runqlat과 같은 표준 방식). 정확한 값이 아니라 버킷 경계 근사.
+  double p50_latency_us = 7;
+  double p95_latency_us = 8;
+  double p99_latency_us = 9;
+  double p999_latency_us = 10;
+}
+
+message DevicePerf {
+  string device = 1;
+  repeated QueuePerf queues = 2;
+  bool available = 3;   // eBPF 수집기가 안 떠 있으면 false
+  string error = 4;
+  QueuePerf aggregate = 5;   // 이 디바이스의 모든 큐를 합산한 percentile/iops/bw (qid=-1)
+}
+
+// kind == "timeout" 이벤트에만 있는 종류별 상세(kprobe:nvme_timeout).
+// 리셋/AER 같은 다른 종류엔 tag도 cdw도 없으므로 공통 봉투가 아니라 여기
+// 종류별 메시지로 분리한다 — DESIGN.md §9.11.
+message TimeoutEventDetail {
+  int32 tag = 1;             // blk-mq 태그 = NVMe cid의 하위 12비트
+  int32 opcode = 2;
+  string opcode_name = 3;
+  uint32 nsid = 4;   // 위와 같은 이유로 uint32
+  int32 flags = 5;
+  uint32 cdw10 = 6;
+  uint32 cdw11 = 7;
+  uint32 cdw12 = 8;
+  uint32 cdw13 = 9;
+  uint32 cdw14 = 10;
+  uint32 cdw15 = 11;
+  double elapsed_us = 12;    // 커맨드 제출~타임아웃 감지까지 걸린 시간
+}
+
+// NVMe 이벤트 1건의 종류 무관 공통 봉투. 목록/스트림/UI는 이 공통 필드만으로
+// 나열하고(그래서 특정 종류가 목록 전체를 대표하지 않는다), 종류별 필드는
+// 아래 oneof detail 중 kind에 대응하는 하나에만 들어간다. 소비자는 모르는
+// kind를 만나도 summary 한 줄로 그릴 수 있어야 한다.
+message NvmeEvent {
+  string kind = 1;          // "timeout" | (향후) "reset" 등
+  double observed_at = 2;   // 호스트가 로그에서 이 줄을 읽은 시각(epoch 초) — 발생 시각 근사
+  string device = 3;
+  int32 qid = 4;             // 관련 큐. 큐와 무관한 종류면 -1
+  string summary = 5;        // 종류를 몰라도 한 줄로 뿌릴 수 있는 요약문
+
+  // [한국어] oneof라서 kind에 해당하는 상세 하나만 실려 온다. 새 종류는
+  // 여기 필드 번호를 이어서 추가하면 되고 기존 소비자는 안 깨진다(모르는
+  // 필드는 무시하고 summary로 그린다).
+  oneof detail {
+    TimeoutEventDetail timeout = 10;
+    ErrorEventDetail error = 11;
+  }
+}
+
+// kind == "error" 이벤트의 종류별 상세 — status != 0으로 완료된 커맨드.
+// status는 phase 비트가 제거된 값(드라이버의 nvme_req(req)->status 그대로)이며
+// sct/sc/dnr/more/crd는 거기서 분해한 것이다.
+message ErrorEventDetail {
+  int32 cid = 1;
+  int32 tag = 2;
+  int32 opcode = 3;
+  string opcode_name = 4;
+  uint32 nsid = 5;   // u32 — 0xFFFFFFFF(broadcast)가 정상 값이라 int32면 범위 초과
+  uint32 status = 6;         // 원본(phase 제거) status
+  int32 sct = 7;              // bits[10:8] 상태 코드 타입
+  int32 sc = 8;               // bits[7:0] 상태 코드
+  string sct_name = 9;
+  string sc_name = 10;
+  bool dnr = 11;              // bit[14] Do Not Retry — 재시도 불가
+  bool more = 12;             // bit[13] 추가 정보가 에러 로그 페이지에 있음
+  int32 crd = 13;             // bits[12:11] Command Retry Delay
+  int32 retries = 14;         // 커널이 이미 재시도한 횟수
+  uint64 slba = 15;           // read/write일 때만 유효
+  int32 nlb = 16;             // 실제 블록 수(0-based NLB + 1)
+  bool lba_valid = 17;        // opcode가 read/write라 slba/nlb가 의미 있는가
+  bool submit_cached = 18;    // 제출(nvme_setup_cmd)을 봤는가
+  double elapsed_us = 19;     // 제출~완료
+}
+
+message ErrorStatusCount {
+  int32 sct = 1;
+  int32 sc = 2;
+  string sct_name = 3;
+  string sc_name = 4;
+  int64 count = 5;           // 수집기 시작 이후 누적
+}
+
+message ErrorStatsReply {
+  string device = 1;
+  repeated ErrorStatusCount counts = 2;
+  int64 total = 3;
+  bool available = 4;        // 수집기가 없거나 로그가 없으면 false
+  string error = 5;
+}
+
+message EventKind {
+  string kind = 1;           // "timeout" | "error" | ...
+  string label = 2;
+  string source = 3;          // 어디서 오는가 (eBPF 훅 이름 등)
+  string description = 4;
+  bool active = 5;            // 이 백엔드에서 실제로 수집 중인가
+}
+
+message EventKindsReply {
+  repeated EventKind kinds = 1;
+}
+
+// [한국어] 노드 종류마다 보여줄 속성이 완전히 달라서(PCIe는 BDF/클래스,
+// 네임스페이스는 nsid/용량) 종류별 필드를 메시지에 박지 않고 key-value 목록으로
+// 둔다 — 새 노드 종류가 생겨도 proto/UI를 안 고쳐도 된다.
+message TopologyDetail {
+  string key = 1;
+  string value = 2;
+}
+
+message TopologyNode {
+  string id = 1;             // 안정적인 노드 키 ("pci:0000:00:04.0" 등)
+  string kind = 2;            // system|host_bridge|pci_bridge|pci_endpoint|
+                              // nvme_ctrl|nvme_subsystem|namespace|queue_group|queue
+  string label = 3;
+  string sublabel = 4;
+  string device = 5;          // 이 노드가 속한 디바이스("nvme0") — 선택 강조용
+  repeated TopologyDetail details = 6;
+  repeated TopologyNode children = 7;   // proto3는 재귀 메시지를 그대로 지원
+}
+
+message TopologyReply {
+  TopologyNode root = 1;
+  string backend_kind = 2;
+  string error = 3;
+}
+
+// ---- 프로세스 프로파일러 메시지들 ----
+message ProcessInfoMsg {
+  int32 pid = 1;             // TGID
+  string comm = 2;
+  string cmdline = 3;         // 전체 인자 — fio는 여기에 워크로드 정의가 다 있다
+  string exe_path = 4;
+  int32 uid = 5;
+  uint64 start_time_ns = 6;   // PID 재사용 구분용
+  int32 thread_count = 7;
+  repeated ThreadRef threads = 8;
+  string error = 9;           // 읽기 실패 사유(권한/경합) — 해당 필드만 비운다
+}
+
+message ThreadRef {
+  int32 tid = 1;
+  string comm = 2;
+}
+
+message ProcessListRequest {
+  bool only_io = 1;           // NVMe I/O를 내는 프로세스만(기본 필터 권장)
+}
+
+message ProcessListEntryMsg {
+  ProcessInfoMsg info = 1;
+  bool io_active = 2;
+  double io_rate = 3;          // 최근 1초 IOPS
+  repeated string target_devices = 4;
+  bool is_target = 5;
+  string matched_rule = 6;
+  bool selectable = 7;
+  string unselectable_reason = 8;
+}
+
+message ProcessListReply {
+  repeated ProcessListEntryMsg processes = 1;
+}
+
+message TargetRuleMsg {
+  string kind = 1;             // pid | name | name_pattern | cmdline_pattern
+  string value = 2;
+  string adapter = 3;           // 비우면 자동 선택
+}
+
+message TargetsReply {
+  repeated TargetRuleMsg rules = 1;
+}
+
+message WorkloadSpecMsg {
+  uint32 io_size = 1;
+  string rw = 2;
+  string pattern = 3;
+  int32 queue_depth = 4;
+  string ioengine = 5;
+  bool direct = 6;
+  string filename = 7;
+  int32 numjobs = 8;
+  int32 runtime_sec = 9;
+  bool has_spec = 10;          // 기대값 자체가 없는 경우와 구분
+}
+
+message MeasuredWorkloadMsg {
+  uint32 io_size_dominant = 1;
+  double read_ratio = 2;
+  double write_ratio = 3;
+  double queue_depth_avg = 4;   // 리틀의 법칙 근사
+  double iops = 5;
+  double bandwidth_bps = 6;
+}
+
+message LogicalGroupMsg {
+  string name = 1;
+  string type = 2;              // fio_job | thread_prefix | process ...
+  string source = 3;            // cmdline_parse | comm_prefix | inferred ...
+  repeated int32 thread_tids = 4;
+  WorkloadSpecMsg expected_workload = 5;
+  MeasuredWorkloadMsg measured_workload = 6;
+  // 기대값이 없으면 판단 불가 — "불일치"와 구분해야 하므로 별도 플래그를 둔다.
+  bool has_expectation = 7;
+  bool expectation_match = 8;
+  repeated string mismatch_reasons = 9;
+  bool inferred = 10;            // 관측으로 "추정"한 정보(확정 정보와 구분)
+  double progress_pct = 11;
+}
+
+message SessionMsg {
+  string session_id = 1;
+  int32 pid = 2;
+  string comm = 3;
+  string cmdline = 4;
+  string exe_path = 5;
+  string adapter = 6;
+  string status = 7;             // active | finished
+  uint64 start_time_ns = 8;
+  uint64 session_start_ns = 9;
+  uint64 session_end_ns = 10;
+  repeated string devices = 11;
+  int32 thread_count_active = 12;
+  MeasuredWorkloadMsg aggregate = 13;
+  repeated LogicalGroupMsg logical_groups = 14;
+  string matched_rule = 15;
+}
+
+message UnmonitoredIoMsg {
+  int32 pid = 1;
+  string comm = 2;
+  string device = 3;
+  double io_rate = 4;
+  string note = 5;
+}
+
+message DeviceAttributionMsg {
+  string name = 1;
+  double total_iops = 2;
+  double attributed_iops = 3;
+  double unattributed_iops = 4;
+  repeated string contributing_sessions = 5;
+  bool multi_process_warning = 6;
+}
+
+message ProfileReply {
+  string schema_version = 1;     // "2.0"
+  uint64 collected_at_ns = 2;
+  repeated SessionMsg sessions = 3;
+  repeated UnmonitoredIoMsg unmonitored_io = 4;
+  repeated DeviceAttributionMsg devices = 5;
+  repeated TargetRuleMsg rules = 6;
+  bool available = 7;
+  string error = 8;
+}
+
+message EventsReply {
+  string device = 1;
+  repeated NvmeEvent events = 2;
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telemetryd"
+version = "0.1.0"
+description = "drgn/eBPF 기반 NVMe telemetry 서비스 — 순수 Python 라이브러리 / CPython 임베딩 / gRPC / CLI / Web"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+drgn = ["drgn>=0.2.0"]
+grpc = ["grpcio>=1.60", "grpcio-tools>=1.60"]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+telemetryd = "telemetryd.cli.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
