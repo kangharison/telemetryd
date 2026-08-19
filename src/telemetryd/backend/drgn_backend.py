@@ -26,107 +26,9 @@ from telemetryd.platform.kernel import DrgnKernelSession
 from telemetryd.services.events import EbpfEventService
 from telemetryd.services.perf import EbpfPerfService
 from telemetryd.services.profiler import NvmeProfilerService
+from telemetryd.services.queues import DrgnQueueService
 from telemetryd.services.topology import DrgnTopologyService
 from telemetryd import treewalk
-
-
-def _window_indices(doorbell: int, depth: int, limit: int) -> List[int]:
-    """도어벨(sq_tail 또는 cq_head) 바로 앞 최근 limit개 인덱스 — **최신(도어벨
-    바로 앞)부터 오래된 순으로** 내림차순(링 버퍼 wrap 처리). limit<=0이거나
-    depth 이상이면 전체 depth. mock_backend.py의 동명 함수와 동일 규칙(실제 커널판)."""
-    n = min(limit, depth) if limit else depth
-    return [(doorbell - 1 - i) % depth for i in range(n)]
-
-_DISK_RE = re.compile(rb"^nvme(\d+)n1$")
-
-
-
-def _iommu_enabled() -> bool:
-    """/sys/class/iommu/ 가 비어있지 않으면 IOMMU 활성 — PRP가 물리주소가 아닌
-    IOVA일 수 있어(§DESIGN 0) 스냅샷에 플래그로 남긴다. 이건 drgn이 아니라
-    이 프로세스가 돌아가는 호스트 자체의 sysfs를 보는 것(같은 머신이므로 OK)."""
-    try:
-        return len(os.listdir("/sys/class/iommu")) > 0
-    except FileNotFoundError:
-        return False
-
-
-def _decode_prp_pages(prog, prp1: int, prp2: int, total_len: int) -> List[PrpPage]:
-    """04_prp_payload.py의 analyze_prp()를 그대로 옮기되, print 대신 PrpPage 리스트로.
-
-    리스트 페이지(case C)의 엔트리도 커널 가상주소(iod.descriptors[0])를 거치지
-    않고 prp2 물리주소를 직접 읽어(physical=True) 파싱한다 — IOMMU 비활성
-    환경에서는 PRP2 자체가 이미 그 리스트 페이지의 물리주소이므로 이렇게 해도
-    같은 내용을 얻는다(§DESIGN 0).
-
-    요구사항: "PRP 확인"은 **데이터 페이로드를 최대 MAX_PAGE_DUMP(4096B)까지만**
-    보여준다. bs=64k 같은 큰 I/O는 실제로 여러 페이지(case C, PRP 리스트)에
-    걸치는데, 예전엔 리스트 페이지당 최대 8개 데이터 페이지(최대 32KB)까지
-    다 읽어서 응답이 UI로 다루기엔 너무 커졌다(실사용 중 발견). 그래서 아래
-    `shown` 누적치로 데이터 바이트 총합을 4096에서 끊는다 — PRP 리스트 페이지
-    자체(`is_list_page=True`, 메타데이터)는 데이터가 아니라 캡 대상에서 뺀다.
-    """
-    pages: List[PrpPage] = []
-    if prp1 == 0 or total_len <= 0:
-        return pages
-
-    offset = prp1 & PAGE_MASK
-    first_page_bytes = min(total_len, PAGE_SIZE - offset)  # 케이스 판별(1/2/3+페이지)은 캡과 무관하게 실제 크기로
-    first_bytes = min(first_page_bytes, MAX_PAGE_DUMP)      # 실제로 읽어서 보여줄 양만 캡
-    pages.append(_read_page(prog, prp1, offset, first_bytes))
-    shown = first_bytes
-    remaining = total_len - first_page_bytes
-    if remaining <= 0 or shown >= MAX_PAGE_DUMP:
-        return pages
-
-    n_more = -(-remaining // PAGE_SIZE)  # ceil div
-    if n_more == 1:
-        page_bytes = min(remaining, MAX_PAGE_DUMP - shown)
-        if page_bytes > 0:
-            pages.append(_read_page(prog, prp2, 0, page_bytes))
-        return pages
-
-    # case C: PRP2 는 PRP 리스트 페이지의 물리주소. 메타데이터라 4KB 캡과 무관하게 항상 보여준다.
-    pages.append(_read_page(prog, prp2, 0, min(remaining, PAGE_SIZE), is_list_page=True))
-    if shown >= MAX_PAGE_DUMP:
-        return pages
-    show = min(n_more, PRPS_PER_PAGE - 1, 8)  # 리스트 자체가 너무 길면 8엔트리까지만 조회
-    try:
-        raw = prog.read(prp2, show * 8, physical=True)
-        entries = struct.unpack(f"<{show}Q", raw)
-    except Exception:
-        entries = ()
-    for i, entry_phys in enumerate(entries):
-        if shown >= MAX_PAGE_DUMP:
-            break
-        page_bytes = min(PAGE_SIZE, remaining - i * PAGE_SIZE, MAX_PAGE_DUMP - shown)
-        if page_bytes <= 0:
-            break
-        pages.append(_read_page(prog, entry_phys, 0, page_bytes))
-        shown += page_bytes
-    return pages
-
-
-def _read_page(prog, phys: int, offset: int, nbytes: int, is_list_page: bool = False) -> PrpPage:
-    nbytes = max(0, min(nbytes, PAGE_SIZE))
-    try:
-        data = bytes(prog.read(phys, nbytes, physical=True))
-    except Exception:
-        data = b""  # MMIO/미매핑/P2P 메모리 등 — FaultError를 조용히 삼키고 빈 페이로드로 표기
-    return PrpPage(phys_addr=phys, offset_in_page=offset, data=data, is_list_page=is_list_page)
-
-
-def _cdw2_cdw3(common) -> Tuple[int, int]:
-    """커널 버전에 따라 struct nvme_common_command 의 cdw2 필드가 개별
-    cdw2/cdw3 인지, `__le32 cdw2[2]` 배열인지가 다를 수 있어 둘 다 시도한다."""
-    try:
-        return int(common.cdw2), int(common.cdw3)
-    except (AttributeError, LookupError, TypeError):
-        try:
-            arr = common.cdw2
-            return int(arr[0]), int(arr[1])
-        except Exception:
-            return 0, 0
 
 
 class DrgnBackend:
@@ -175,6 +77,7 @@ class DrgnBackend:
         self._ebpf_log_path = ebpf_log_path
         # [한국어] 도메인별 서비스(services/*)로 옮겨간 것들. 이 백엔드는 이제
         # 그 서비스들 앞의 파사드 역할을 하며, 옮겨간 메서드는 위임만 한다.
+        self._queues = DrgnQueueService(self._kernel)
         self._perf = EbpfPerfService(self._ebpf)
         self._events = EbpfEventService(self._ebpf)
         self._profiler = NvmeProfilerService(
@@ -190,295 +93,31 @@ class DrgnBackend:
 
     # ---- 디바이스 탐색 (02_nvme_queues.py 재사용) --------------------------
 
-    def _find_disk(self, disk_name_bytes: bytes):
-        from drgn.helpers.linux.block import disk_name, for_each_disk
-
-        prog = self._ensure_program()
-        for disk in for_each_disk(prog):
-            if disk_name(disk) == disk_name_bytes:
-                return disk
-        return None
+    # ---- 큐/장치: services/queues 로 위임(Facade) ------------------------
 
     def _get_dev_and_disk(self, device: str):
-        from drgn import cast, container_of
-
-        disk = self._find_disk(f"{device}n1".encode())
-        if disk is None:
-            raise DeviceNotFoundError(device)
-        ns = cast("struct nvme_ns *", disk.private_data)
-        ctrl = ns.ctrl
-        dev = container_of(ctrl, "struct nvme_dev", "ctrl")
-        return dev, disk
+        """토폴로지 서비스가 콜러블로 주입받는 커널 객체 조회."""
+        return self._queues.lookup_device(device)
 
     def list_devices(self) -> List[str]:
-        from drgn.helpers.linux.block import disk_name, for_each_disk
-
-        prog = self._ensure_program()
-        names = []
-        for disk in for_each_disk(prog):
-            m = _DISK_RE.match(disk_name(disk))
-            if m:
-                names.append(f"nvme{int(m.group(1))}")
-        return sorted(names, key=lambda s: int(s[4:]))
-
-    # ---- 요청사항 1: 큐 스냅샷 (sq_tail/cq_head/inflight) ------------------
-
-    def _inflight_by_hctx(self, q) -> Tuple[Dict[int, int], Dict[int, int]]:
-        from drgn import FaultError
-        from drgn.helpers.linux.block import request_queue_busy_iter
-
-        driver: Dict[int, int] = {}
-        sched: Dict[int, int] = {}
-        for tags, bucket in (("driver", driver), ("sched", sched)):
-            try:
-                for rq in request_queue_busy_iter(q, tags):
-                    hctx = rq.mq_hctx
-                    if not hctx:
-                        continue
-                    idx = int(hctx.queue_num)
-                    bucket[idx] = bucket.get(idx, 0) + 1
-            except (FaultError, LookupError):
-                # [한국어] 스케줄러가 none 이면 "sched" 태그공간 자체가 없을 수 있음 — 조용히 스킵.
-                continue
-        return driver, sched
+        return self._queues.list_devices()
 
     def get_device_snapshot(self, device: str) -> DeviceSnapshot:
-        dev, disk = self._get_dev_and_disk(device)
-        ctrl = dev.ctrl
-        online = int(dev.online_queues)
-        nr_alloc = int(dev.nr_allocated_queues) if hasattr(dev, "nr_allocated_queues") else online
-        try:
-            model = ctrl.model_number.string_().decode(errors="replace").strip()
-        except Exception:
-            model = "?"
+        return self._queues.get_device_snapshot(device)
 
-        driver_counts, sched_counts = self._inflight_by_hctx(disk.queue)
+    def get_queue_entries(self, device: str, qid: int, limit: int = 16,
+                          around_doorbell: bool = True) -> List[QueueEntry]:
+        return self._queues.get_queue_entries(device, qid, limit, around_doorbell)
 
-        queues: List[QueueSnapshot] = []
-        for qid in range(online):
-            nvmeq = dev.queues[qid]
-            is_admin = qid == 0
-            hctx_index = None if is_admin else qid - 1
-            queues.append(
-                QueueSnapshot(
-                    index=qid,
-                    qid=int(nvmeq.qid),
-                    is_admin=is_admin,
-                    depth=int(nvmeq.q_depth),
-                    sq_tail=int(nvmeq.sq_tail),
-                    cq_head=int(nvmeq.cq_head),
-                    sq_dma_addr=int(nvmeq.sq_dma_addr),
-                    cq_dma_addr=int(nvmeq.cq_dma_addr),
-                    hctx_index=hctx_index,
-                    inflight_driver=driver_counts.get(hctx_index, 0) if hctx_index is not None else 0,
-                    inflight_sched=sched_counts.get(hctx_index, 0) if hctx_index is not None else 0,
-                )
-            )
-
-        return DeviceSnapshot(
-            name=device,
-            addr=int(dev.value_()),
-            model=model,
-            online_queues=online,
-            allocated_queues=nr_alloc,
-            bar_addr=int(dev.bar.value_()),
-            dbs_addr=int(dev.dbs.value_()),
-            iommu_enabled=_iommu_enabled(),
-            backend_kind=self.kind,
-            queues=queues,
-        )
-
-    # ---- 요청사항 2: 큐 클릭 -> CDW 전체 -----------------------------------
-
-    def get_queue_entries(
-        self, device: str, qid: int, limit: int = 16, around_doorbell: bool = True
-    ) -> List[QueueEntry]:
-        from drgn import FaultError, cast
-
-        dev, _disk = self._get_dev_and_disk(device)
-        online = int(dev.online_queues)
-        if not (0 <= qid < online):
-            raise QueueNotFoundError(qid)
-        nvmeq = dev.queues[qid]
-        depth = int(nvmeq.q_depth)
-        is_admin = qid == 0
-        if around_doorbell:
-            indices = _window_indices(int(nvmeq.sq_tail), depth, limit or 16)
-        else:
-            indices = list(range(min(limit, depth) if limit else depth))
-
-        sqc = cast("struct nvme_command *", nvmeq.sq_cmds)
-        out: List[QueueEntry] = []
-        for i in indices:
-            try:
-                common = sqc[i].common
-                opcode = int(common.opcode)
-                flags = int(common.flags)
-                cdw2, cdw3 = _cdw2_cdw3(common)
-                out.append(
-                    QueueEntry(
-                        index=i,
-                        cid=int(common.command_id),
-                        opcode=opcode,
-                        opcode_name=opcode_name(opcode, is_admin),
-                        nsid=int(common.nsid),
-                        flags=flags,
-                        uses_sgl=((flags >> 6) & 0x3) != 0,
-                        cdw2=cdw2,
-                        cdw3=cdw3,
-                        cdw10=int(common.cdw10),
-                        cdw11=int(common.cdw11),
-                        cdw12=int(common.cdw12),
-                        cdw13=int(common.cdw13),
-                        cdw14=int(common.cdw14),
-                        cdw15=int(common.cdw15),
-                        prp1=int(common.dptr.prp1),
-                        prp2=int(common.dptr.prp2),
-                    )
-                )
-            except FaultError:
-                continue
-        return out
-
-    def get_completion_entries(
-        self, device: str, qid: int, limit: int = 16, around_doorbell: bool = True
-    ) -> List[CompletionEntry]:
-        """CQ 링(nvmeq.cqes, struct nvme_completion[]) 덤프. status 필드는
-        bit0=phase, bits[15:1]에 SCT/SC/M/DNR이 실려있어 여기서 미리 분해한다."""
-        from drgn import FaultError, cast
-
-        dev, _disk = self._get_dev_and_disk(device)
-        online = int(dev.online_queues)
-        if not (0 <= qid < online):
-            raise QueueNotFoundError(qid)
-        nvmeq = dev.queues[qid]
-        depth = int(nvmeq.q_depth)
-        if around_doorbell:
-            indices = _window_indices(int(nvmeq.cq_head), depth, limit or 16)
-        else:
-            indices = list(range(min(limit, depth) if limit else depth))
-
-        cqes = cast("struct nvme_completion *", nvmeq.cqes)
-        out: List[CompletionEntry] = []
-        for i in indices:
-            try:
-                cqe = cqes[i]
-                status_raw = int(cqe.status)
-                try:
-                    result = int(cqe.result.u32)
-                except (AttributeError, LookupError, TypeError):
-                    result = int(cqe.result.u16)  # 구버전/축소 레이아웃 fallback
-                out.append(
-                    CompletionEntry(
-                        index=i,
-                        command_id=int(cqe.command_id),
-                        sq_id=int(cqe.sq_id),
-                        sq_head=int(cqe.sq_head),
-                        status_raw=status_raw,
-                        phase=bool(status_raw & 0x1),
-                        status_code=(status_raw >> 1) & 0xFF,
-                        status_code_type=(status_raw >> 9) & 0x7,
-                        result=result,
-                    )
-                )
-            except FaultError:
-                continue
-        return out
-
-    # ---- 요청사항 3: "PRP 확인" -> 4KB 페이로드 -----------------------------
-
-    def _resolve_total_len(self, disk, qid: int, cid: int, cmd, is_admin: bool) -> Tuple[int, Optional[str]]:
-        """총 전송 길이. 1순위: blk-mq iod.total_len(가장 정확, in-flight일 때만
-        가능) — 04_prp_payload.py와 동일한 경로. 2순위: read/write 커맨드의
-        cdw12(NLB, 0-based) * 512B 추정(요청이 이미 완료돼 blk-mq에서 못 찾을 때)."""
-        from drgn import FaultError, cast
-        from drgn.helpers.linux.block import blk_mq_rq_to_pdu, blk_rq_bytes, request_queue_busy_iter
-
-        hctx_index = None if is_admin else qid - 1
-        try:
-            for rq in request_queue_busy_iter(disk.queue, "driver"):
-                if int(rq.tag) != cid:
-                    continue
-                hctx = rq.mq_hctx
-                if hctx_index is not None and (not hctx or int(hctx.queue_num) != hctx_index):
-                    continue
-                iod = cast("struct nvme_iod *", blk_mq_rq_to_pdu(rq))
-                try:
-                    return int(iod.total_len), None
-                except (AttributeError, FaultError):
-                    return int(blk_rq_bytes(rq)), "iod.total_len 없음 → blk_rq_bytes로 대체"
-        except (FaultError, LookupError):
-            pass
-
-        opcode = int(cmd.common.opcode)
-        if not is_admin and opcode in (0x01, 0x02):  # write, read
-            try:
-                nlb = int(cmd.rw.length)
-            except Exception:
-                nlb = int(cmd.common.cdw12) & 0xFFFF
-            return (nlb + 1) * 512, "요청을 blk-mq에서 못 찾음(이미 완료됐을 수 있음) → cdw12(NLB)*512B 추정"
-        if is_admin and opcode == 0x06:  # identify
-            # [한국어] Identify 데이터 구조는 스펙상 항상 정확히 4096B(1페이지) 고정이라
-            # NLB 같은 CDW 필드에 안 실려있다 — blk-mq에서 못 찾아도(이미 완료돼도)
-            # 걱정 없이 상수로 확정할 수 있다(웹에서 identify PRP가 "총 전송 길이를
-            # 알 수 없음"으로 막히던 문제 — 실사용 중 발견).
-            return PAGE_SIZE, None
-        if is_admin and opcode == 0x02:  # get_log_page
-            # [한국어] NUMDL(cdw10[31:16]) + NUMDU(cdw11[15:0]) = 0-based dword 개수.
-            cdw10 = int(cmd.common.cdw10)
-            cdw11 = int(cmd.common.cdw11)
-            numdl = (cdw10 >> 16) & 0xFFFF
-            numdu = cdw11 & 0xFFFF
-            ndw = ((numdu << 16) | numdl) + 1
-            return ndw * 4, None
-        return 0, "총 전송 길이를 알 수 없음(비-R/W/identify/get_log 커맨드이며 in-flight 요청도 못 찾음)"
+    def get_completion_entries(self, device: str, qid: int, limit: int = 16,
+                               around_doorbell: bool = True) -> List[CompletionEntry]:
+        return self._queues.get_completion_entries(device, qid, limit, around_doorbell)
 
     def get_prp_payload(self, device: str, qid: int, cid: int) -> PrpPayload:
-        from drgn import FaultError, cast
-
-        prog = self._ensure_program()
-        dev, disk = self._get_dev_and_disk(device)
-        online = int(dev.online_queues)
-        if not (0 <= qid < online):
-            raise QueueNotFoundError(qid)
-        nvmeq = dev.queues[qid]
-        depth = int(nvmeq.q_depth)
-        is_admin = qid == 0
-
-        sqc = cast("struct nvme_command *", nvmeq.sq_cmds)
-        cmd = None
-        for i in range(depth):
-            try:
-                c = sqc[i]
-                if int(c.common.command_id) == cid:
-                    cmd = c
-                    break
-            except FaultError:
-                continue
-        if cmd is None:
-            return PrpPayload(device=device, qid=qid, cid=cid, uses_sgl=False, total_len=0, pages=[],
-                               error=f"SQ 링에서 cid={cid} 를 찾지 못함 (큐 depth={depth})")
-
-        flags = int(cmd.common.flags)
-        psdt = (flags >> 6) & 0x3
-        if psdt != 0:
-            return PrpPayload(device=device, qid=qid, cid=cid, uses_sgl=True, total_len=0, pages=[])
-
-        prp1 = int(cmd.common.dptr.prp1)
-        prp2 = int(cmd.common.dptr.prp2)
-        total_len, note = self._resolve_total_len(disk, qid, cid, cmd, is_admin)
-        pages = _decode_prp_pages(prog, prp1, prp2, total_len) if total_len > 0 else []
-        return PrpPayload(device=device, qid=qid, cid=cid, uses_sgl=False, total_len=total_len,
-                           pages=pages, error=note)
-
-    # ---- 요청사항 4/6: 포인터 트리 (depth<=10) ------------------------------
+        return self._queues.get_prp_payload(device, qid, cid)
 
     def get_tree_node(self, device: str, path: List[str]):
-        dev, _disk = self._get_dev_and_disk(device)
-        root_obj = dev[0]  # struct nvme_dev* -> struct nvme_dev (구조체 자체를 루트 노드로)
-        return treewalk.expand(root_obj, device, path)
-
-    # ---- eBPF 실시간 성능 (drgn과 무관 — 순수 파일 읽기, DESIGN.md §6/§9.5) ------
+        return self._queues.get_tree_node(device, path)
 
     def get_performance(self, device: str):
         """성능 서비스로 위임(Facade).
