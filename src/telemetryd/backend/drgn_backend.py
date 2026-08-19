@@ -23,6 +23,7 @@ from telemetryd.models import CompletionEntry, DeviceSnapshot, PrpPage, PrpPaylo
 from telemetryd.nvme_const import MAX_PAGE_DUMP, PAGE_MASK, PAGE_SIZE, PRPS_PER_PAGE, opcode_name
 from telemetryd.platform.ebpf import as_log_source
 from telemetryd.platform.kernel import DrgnKernelSession
+from telemetryd.services.events import EbpfEventService
 from telemetryd.services.perf import EbpfPerfService
 from telemetryd import treewalk
 
@@ -173,15 +174,7 @@ class DrgnBackend:
         # [한국어] 도메인별 서비스(services/*)로 옮겨간 것들. 이 백엔드는 이제
         # 그 서비스들 앞의 파사드 역할을 하며, 옮겨간 메서드는 위임만 한다.
         self._perf = EbpfPerfService(self._ebpf)
-        # [한국어] TimeoutEventReader는 "마지막으로 읽은 파일 오프셋 +
-        # 최근 이벤트 링버퍼" 상태를 들고 있어야 해서(로그를 매번 통째로
-        # 다시 읽지 않으려고, DESIGN.md §9.11) 이 backend 인스턴스 생명주기
-        # 동안 하나만 만들어 재사용한다 — get_performance()와 달리 상태가
-        # 있는 예외적인 경우.
-        self._timeout_reader = None
-        # [한국어] 에러 완료(A2) 리더도 같은 로그 파일을 보지만 자기 오프셋을
-        # 따로 들고 있어야 해서(각자 다른 줄만 관심) 인스턴스를 따로 캐싱한다.
-        self._error_reader = None
+        self._events = EbpfEventService(self._ebpf)
         # [한국어] 프로파일러 대상 규칙/세션 저장소. 데몬과 CLI가 같은 파일을
         # 공유하도록 경로를 주입받을 수 있게 한다(기본은 XDG state 경로).
         self._targets = None
@@ -493,48 +486,12 @@ class DrgnBackend:
         return self._perf.get_performance(device)
 
     def get_events(self, device: str):
-        """이 디바이스의 최근 NVMe 이벤트 목록(종류 무관 — base.py 참고).
-
-        지금은 이벤트 소스가 kprobe:nvme_timeout 하나뿐이라 리더도 하나지만,
-        의도적으로 "여러 소스의 결과를 합쳐 시간순으로 정렬"하는 형태로 써
-        뒀다 — 리셋/AER 같은 소스를 추가할 때 이 메서드에서 리더를 하나 더
-        만들어 sources 리스트에 넣기만 하면 되고, 상위 계층(gRPC/REST/UI)은
-        전혀 안 바뀐다.
-        """
-        from telemetryd.backend.ebpf_timeout_events import TimeoutEventReader
-
-        if not self._ebpf_log_path:
-            # [한국어] 수집기 로그 경로를 모르면 읽을 소스 자체가 없음 —
-            # 에러가 아니라 "아직 관측된 이벤트 없음"으로 본다(성능과 달리
-            # 이벤트는 원래 대부분의 시간 동안 0건인 게 정상이라, 여기서
-            # available=False 류의 구분을 두면 UI만 시끄러워진다).
-            return []
-        from telemetryd.backend.ebpf_error_events import ErrorEventReader
-
-        if self._timeout_reader is None:
-            self._timeout_reader = TimeoutEventReader(self._ebpf_log_path)
-        if self._error_reader is None:
-            self._error_reader = ErrorEventReader(self._ebpf_log_path)
-        sources = [self._timeout_reader, self._error_reader]
-        events = [e for src in sources for e in src.events_for_device(device)]
-        # [한국어] 소스가 2개 이상이 되면 각 소스가 자기 순서대로만 정렬돼
-        # 있으므로 관측 시각으로 다시 병합 정렬해야 목록이 시간순이 된다.
-        events.sort(key=lambda e: e.observed_at)
-        return events
-
+        """이벤트 서비스로 위임(Facade) — 로직은 services/events 에 있다."""
+        return self._events.get_events(device)
 
     def get_error_stats(self, device: str):
-        """SCT/SC 조합별 누적 에러 카운터 — 순수 로그 tail 읽기라 drgn을 안 쓴다."""
-        from telemetryd.backend.ebpf_error_events import read_error_stats
-        from telemetryd.models import DeviceErrorStats
-
-        if not self._ebpf_log_path:
-            return DeviceErrorStats(
-                device=device, available=False,
-                error="ebpf_log_path 미설정 — DrgnBackend(ebpf_log_path=...) 로 "
-                      "bpftrace 출력 파일 경로를 지정해야 함",
-            )
-        return read_error_stats(self._ebpf_log_path, device)
+        """이벤트 서비스로 위임(Facade)."""
+        return self._events.get_error_stats(device)
 
     def get_topology(self):
         """통합 토폴로지 트리 — backend/topology.py에 위임한다.
@@ -683,11 +640,8 @@ class DrgnBackend:
         return self._registry().refresh(self._proc_infos(), stats)
 
     def list_event_kinds(self):
-        """등록된 이벤트 종류 — 수집기 로그 경로가 있어야 실제 수집(active)."""
-        from telemetryd.backend.event_registry import registered_event_kinds
-
-        return registered_event_kinds(active=bool(self._ebpf_log_path))
-
+        """이벤트 서비스로 위임(Facade)."""
+        return self._events.list_event_kinds()
 
 def doctor(backend: "DrgnBackend | None" = None) -> dict:
     """00_env_check.py를 구조화한 버전 — `telemetryd doctor` CLI 커맨드가 쓴다.

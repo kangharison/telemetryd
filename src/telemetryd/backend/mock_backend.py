@@ -52,6 +52,7 @@ from telemetryd.models import (
     TreeNode,
 )
 from telemetryd.nvme_const import ADM_OPC, MAX_PAGE_DUMP, NVM_OPC, PAGE_SIZE, opcode_name
+from telemetryd.services.events import MockEventService
 from telemetryd.services.perf import MockPerfService
 
 MAX_DEPTH = 10          # treewalk.py의 실제 규칙과 동일 (§DESIGN 5.5) — 여기선 drgn 비의존을 위해 상수 중복
@@ -127,6 +128,7 @@ class MockBackend:
         self._targets = None
         # [한국어] 도메인별 서비스(services/*)의 mock 구현. 이 백엔드는 그 앞의
         # 파사드다 — DrgnBackend와 같은 구조를 유지해야 둘을 바꿔 끼울 수 있다.
+        self._events = MockEventService()
         self._perf = MockPerfService(
             queues_of=lambda device: self._topology(device)["online_queues"]
         )
@@ -334,20 +336,14 @@ class MockBackend:
         return self._perf.get_performance(device)
 
     def get_events(self, device: str) -> List[NvmeEvent]:
-        # [한국어] 타임아웃/리셋 같은 이벤트는 정상적으로는 거의 안 일어나는
-        # 것들이라 mock에서 합성하지 않는다(실제로 일어난 것처럼 흉내내는 게
-        # 오히려 오해를 살 수 있음) — 파싱/봉투 구성 로직 자체는
-        # test_ebpf_timeout_events.py가 실제 로그 포맷을 그대로 흉내낸
-        # 텍스트로 검증한다. mock에서는 "이벤트 없음"이 정상 상태고, UI/CLI가
-        # 빈 목록을 어떻게 그리는지도 이걸로 확인된다.
-        self._topology(device)  # DeviceNotFoundError를 다른 get_* 메서드들과 똑같이 내게
-        return []
+        """이벤트 서비스(mock)로 위임 — 로직은 services/events/mock.py."""
+        self._topology(device)   # 없는 디바이스면 다른 get_*과 똑같이 예외
+        return self._events.get_events(device)
 
     def get_error_stats(self, device: str) -> DeviceErrorStats:
-        # [한국어] get_events와 같은 이유로 합성하지 않는다 — 안 난 에러를
-        # 난 것처럼 보여주면 안 된다. "수집은 되지만 0건"으로 응답한다.
+        """이벤트 서비스(mock)로 위임."""
         self._topology(device)
-        return DeviceErrorStats(device=device, counts=[], total=0, available=True)
+        return self._events.get_error_stats(device)
 
     def get_topology(self) -> Topology:
         """합성 PCIe+NVMe 통합 트리.
@@ -553,13 +549,8 @@ class MockBackend:
         return self._registry().refresh(self._mock_processes(), self._mock_proc_stats())
 
     def list_event_kinds(self) -> List[EventKindInfo]:
-        # [한국어] 등록 목록 자체는 백엔드와 무관한 시스템 속성이라 mock도 같은
-        # 목록을 준다. 다만 mock에는 eBPF 수집기가 없으므로 active=False —
-        # "등록은 돼 있지만 지금 수집되진 않는다"가 화면에 그대로 드러난다.
-        from telemetryd.backend.event_registry import registered_event_kinds
-
-        return registered_event_kinds(active=False)
-
+        """이벤트 서비스(mock)로 위임."""
+        return self._events.list_event_kinds()
 
 def _synthetic_page(phys: int, offset: int, nbytes: int, is_list_page: bool = False) -> PrpPage:
     nbytes = max(0, min(nbytes, PAGE_SIZE))
